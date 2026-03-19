@@ -58,8 +58,7 @@ async def run_once(config) -> None:
                 else:
                     sensor_temps[fan_cfg.sensor_id] = temp
                     points = [{"temp": p.temp, "percent": p.percent} for p in curve.points]
-                    raw_percent = interpolate(points, temp)
-                    percent = max(raw_percent, config.settings.safety_floor_percent)
+                    percent = interpolate(points, temp)
 
         try:
             set_fan_speed(fan_cfg.fan_id, percent)
