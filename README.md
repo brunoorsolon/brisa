@@ -95,6 +95,7 @@ Example `docker-compose.yml`:
 services:
   brisa:
     image: brisa:latest
+    build: ./brisa
     container_name: brisa
     restart: unless-stopped
     privileged: true
@@ -102,7 +103,7 @@ services:
     ports:
       - "9595:9595"
     volumes:
-      - /mnt/fast/docker/brisa:/data
+      - /docker/brisa:/data
 ```
 
 ---
