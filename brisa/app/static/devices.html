@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Brisa — Sensors & Fans</title>
+  <link rel="stylesheet" href="/style.css">
+  <style>
+    .alias-cell { display: flex; align-items: center; gap: 8px; }
+    .alias-display { display: flex; flex-direction: column; gap: 2px; }
+    .alias-name { font-size: 13px; color: var(--text); }
+    .alias-id   { font-size: 11px; color: var(--text-muted); font-family: var(--font-mono); }
+
+    .alias-edit-wrap { display: flex; align-items: center; gap: 6px; }
+    .alias-input {
+      background: var(--bg); border: 1px solid var(--accent);
+      border-radius: var(--radius); color: var(--text);
+      padding: 4px 8px; font-size: 12px; outline: none;
+      width: 180px;
+    }
+    .edit-btn {
+      background: none; border: none; color: var(--text-muted);
+      padding: 2px 4px; font-size: 13px; line-height: 1;
+      cursor: pointer; opacity: 0.5; transition: opacity var(--transition);
+    }
+    .edit-btn:hover { opacity: 1; color: var(--accent); }
+    tr:hover .edit-btn { opacity: 0.8; }
+  </style>
+</head>
+<body>
+  <div id="sidebar" class="sidebar"></div>
+  <div class="main">
+    <div class="page">
+      <div class="page-header">
+        <div style="display:flex; align-items:center; justify-content:space-between;">
+          <div>
+            <h1 class="page-title">Sensors & Fans</h1>
+            <p class="page-subtitle">All detected hardware — click ✎ to set an alias for any sensor</p>
+          </div>
+          <button class="btn btn-ghost" onclick="loadDevices()" id="refresh-btn">↺ Refresh</button>
+        </div>
+      </div>
+
+      <div class="section">
+        <div class="section-header"><span class="section-title">Temperature Sensors</span></div>
+        <div class="card" style="padding:0">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>Label / Alias</th>
+                <th>Driver</th>
+                <th>Sensor ID</th>
+                <th style="text-align:right">Temp</th>
+              </tr>
+            </thead>
+            <tbody id="sensors-tbody">
+              <tr><td colspan="4" style="color:var(--text-muted); padding:20px">Loading…</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="section">
+        <div class="section-header"><span class="section-title">Fan Channels</span></div>
+        <div class="card" style="padding:0">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>Label</th>
+                <th>Fan ID</th>
+                <th style="text-align:right">Current RPM</th>
+              </tr>
+            </thead>
+            <tbody id="fans-tbody">
+              <tr><td colspan="3" style="color:var(--text-muted); padding:20px">Loading…</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast"></div>
+  <script src="/app.js"></script>
+  <script>
+    let devices = null;
+    let appConfig = null;
+    // Track which row is currently being edited
+    let editingId = null;
+
+    async function loadDevices() {
+      const btn = document.getElementById('refresh-btn');
+      btn.textContent = '↺ Refreshing…';
+      try {
+        [devices, appConfig] = await Promise.all([
+          api('GET', '/devices'),
+          api('GET', '/config'),
+        ]);
+        renderSensors(devices.sensors || []);
+        renderFans(devices.fans || []);
+      } catch (e) {
+        showToast('Failed to load devices: ' + e.message, 'error');
+      } finally {
+        btn.textContent = '↺ Refresh';
+      }
+    }
+
+    function renderSensors(sensors) {
+      const tbody = document.getElementById('sensors-tbody');
+      if (!sensors.length) {
+        tbody.innerHTML = '<tr><td colspan="4" style="color:var(--text-muted);padding:20px">No sensors detected</td></tr>';
+        return;
+      }
+      tbody.innerHTML = sensors.map(s => {
+        const alias = s.alias;
+        const displayLabel = alias || s.label;
+        const showOriginal = !!alias;
+        return `
+          <tr id="row-${CSS.escape(s.id)}">
+            <td>
+              <div class="alias-cell" id="cell-${CSS.escape(s.id)}">
+                <div class="alias-display">
+                  <span class="alias-name">${displayLabel}</span>
+                  ${showOriginal ? `<span class="alias-id">${s.id}</span>` : `<span class="alias-id">${s.id}</span>`}
+                </div>
+                <button class="edit-btn" onclick="startEdit('${s.id.replace(/'/g, "\\'")}')" title="Set alias">✎</button>
+              </div>
+            </td>
+            <td><span class="badge badge-dim">${s.driver}</span></td>
+            <td><span class="mono" style="font-size:12px;color:var(--text-dim)">${s.id}</span></td>
+            <td style="text-align:right">
+              <span class="mono" style="color:var(--accent)">${fmtTemp(s.current_temp)}</span>
+              <span style="color:var(--text-muted);font-size:11px"> °C</span>
+            </td>
+          </tr>
+        `;
+      }).join('');
+    }
+
+    function startEdit(sensorId) {
+      // If already editing this row, cancel
+      if (editingId === sensorId) { cancelEdit(sensorId); return; }
+      // Cancel any other open edit
+      if (editingId) cancelEdit(editingId);
+
+      editingId = sensorId;
+      const cell = document.getElementById('cell-' + CSS.escape(sensorId));
+      if (!cell) return;
+
+      const currentAlias = appConfig.sensor_aliases?.[sensorId] || '';
+      cell.innerHTML = `
+        <div class="alias-edit-wrap">
+          <input class="alias-input" id="alias-input-${CSS.escape(sensorId)}"
+            value="${currentAlias}"
+            placeholder="Enter alias…"
+            onkeydown="handleAliasKey(event, '${sensorId.replace(/'/g, "\\'")}')"
+          />
+          <button class="btn btn-primary" style="padding:4px 10px;font-size:12px"
+            onclick="saveAlias('${sensorId.replace(/'/g, "\\'")}')">Save</button>
+          <button class="btn btn-ghost" style="padding:4px 10px;font-size:12px"
+            onclick="cancelEdit('${sensorId.replace(/'/g, "\\'")}')">✕</button>
+        </div>
+      `;
+      document.getElementById('alias-input-' + CSS.escape(sensorId))?.focus();
+    }
+
+    function cancelEdit(sensorId) {
+      editingId = null;
+      renderSensors(devices.sensors || []);
+    }
+
+    function handleAliasKey(e, sensorId) {
+      if (e.key === 'Enter') saveAlias(sensorId);
+      if (e.key === 'Escape') cancelEdit(sensorId);
+    }
+
+    async function saveAlias(sensorId) {
+      const input = document.getElementById('alias-input-' + CSS.escape(sensorId));
+      if (!input) return;
+      const value = input.value.trim();
+
+      if (!appConfig.sensor_aliases) appConfig.sensor_aliases = {};
+
+      if (value) {
+        appConfig.sensor_aliases[sensorId] = value;
+      } else {
+        // Empty = remove alias
+        delete appConfig.sensor_aliases[sensorId];
+      }
+
+      try {
+        await api('POST', '/config', appConfig);
+        showToast(value ? 'Alias saved' : 'Alias removed', 'ok');
+        editingId = null;
+        // Update the local devices alias and re-render
+        const sensor = (devices.sensors || []).find(s => s.id === sensorId);
+        if (sensor) sensor.alias = value || null;
+        renderSensors(devices.sensors || []);
+      } catch (e) {
+        showToast('Failed to save alias: ' + e.message, 'error');
+      }
+    }
+
+    function renderFans(fans) {
+      const tbody = document.getElementById('fans-tbody');
+      if (!fans.length) {
+        tbody.innerHTML = '<tr><td colspan="3" style="color:var(--text-muted);padding:20px">No fan channels detected</td></tr>';
+        return;
+      }
+      tbody.innerHTML = fans.map(f => `
+        <tr>
+          <td>${f.label}</td>
+          <td><span class="mono" style="font-size:12px;color:var(--text-dim)">${f.id}</span></td>
+          <td style="text-align:right">
+            <span class="mono" style="color:var(--accent)">${fmtRpm(f.current_rpm)}</span>
+            <span style="color:var(--text-muted);font-size:11px"> rpm</span>
+          </td>
+        </tr>
+      `).join('');
+    }
+
+    loadDevices();
+  </script>
+</body>
+</html>

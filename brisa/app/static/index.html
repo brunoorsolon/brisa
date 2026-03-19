@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Brisa — Dashboard</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <div id="sidebar" class="sidebar"></div>
+  <div class="main">
+    <div class="page">
+      <div class="page-header">
+        <div style="display:flex; align-items:center; justify-content:space-between;">
+          <div>
+            <h1 class="page-title"><span class="live-dot"></span>Dashboard</h1>
+            <p class="page-subtitle" id="last-updated">Fetching…</p>
+          </div>
+          <button class="btn btn-ghost" onclick="applyNow()" id="apply-btn">
+            ▶ Apply Now
+          </button>
+        </div>
+      </div>
+
+      <div class="section">
+        <div class="section-header">
+          <span class="section-title">Fan Speeds</span>
+        </div>
+        <div class="grid-4" id="fan-grid">
+          <div class="stat-card"><div class="stat-label" style="color:var(--text-muted)">Loading…</div></div>
+        </div>
+      </div>
+
+      <div class="section">
+        <div class="section-header">
+          <span class="section-title">Temperatures</span>
+        </div>
+        <div class="grid-4" id="temp-grid">
+          <div class="stat-card"><div class="stat-label" style="color:var(--text-muted)">Loading…</div></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast"></div>
+  <script src="/app.js"></script>
+  <script>
+    async function loadState() {
+      try {
+        const data = await api('GET', '/state');
+        renderFans(data.fans || []);
+        renderTemps(data.sensors || []);
+        document.getElementById('last-updated').textContent =
+          'Updated ' + new Date().toLocaleTimeString();
+      } catch (e) {
+        showToast('Failed to load state: ' + e.message, 'error');
+      }
+    }
+
+    function renderFans(fans) {
+      const grid = document.getElementById('fan-grid');
+
+      if (!fans.length) {
+        grid.innerHTML = `<div class="stat-card">
+          <div class="stat-label">No fans configured</div>
+          <div class="stat-sub" style="margin-top:8px">
+            Configure fans in <a href="/fanconfig.html" style="color:var(--accent)">Fan Config</a>
+          </div>
+        </div>`;
+        return;
+      }
+
+      // First render: build all cards
+      if (!document.getElementById('fan-card-' + fans[0].id)) {
+        grid.innerHTML = fans.map(fan => `
+          <div class="stat-card" id="fan-card-${fan.id}">
+            <div class="stat-label">
+              ${fan.label || fan.id}
+              ${fan.override_percent != null ? '<span class="badge badge-warn" style="margin-left:6px;font-size:10px">MANUAL</span>' : ''}
+            </div>
+            <div style="display:flex; align-items:baseline; justify-content:space-between;">
+              <div>
+                <span class="stat-value" id="fan-rpm-${fan.id}">—</span>
+                <span class="stat-unit">rpm</span>
+              </div>
+              <span class="mono" style="font-size:12px; color:var(--text-muted);" id="fan-pct-${fan.id}"></span>
+            </div>
+          </div>
+        `).join('');
+      }
+
+      // Update values
+      fans.forEach(fan => {
+        const rpmEl = document.getElementById('fan-rpm-' + fan.id);
+        flashValue(rpmEl, fmtRpm(fan.current_rpm));
+        const pctEl = document.getElementById('fan-pct-' + fan.id);
+        if (pctEl) pctEl.textContent = fan.last_percent != null ? '(' + fan.last_percent + '%)' : '';
+      });
+    }
+
+    function renderTemps(sensors) {
+      const grid = document.getElementById('temp-grid');
+
+      if (!sensors.length) {
+        grid.innerHTML = `<div class="stat-card">
+          <div class="stat-label">No sensors configured</div>
+          <div class="stat-sub" style="margin-top:8px">
+            Configure fans in <a href="/fanconfig.html" style="color:var(--accent)">Fan Config</a>
+          </div>
+        </div>`;
+        return;
+      }
+
+      // First render: build all cards
+      const firstId = 'temp-card-' + btoa(unescape(encodeURIComponent(sensors[0].sensor_id))).replace(/[^a-zA-Z0-9]/g,'');
+      if (!document.getElementById(firstId)) {
+        grid.innerHTML = sensors.map(s => {
+          const cardId = 'temp-card-' + btoa(unescape(encodeURIComponent(s.sensor_id))).replace(/[^a-zA-Z0-9]/g,'');
+          const label = s.alias || s.sensor_id.split('/').pop();
+          return `
+            <div class="stat-card" id="${cardId}">
+              <div class="stat-label" title="${s.sensor_id}">${label}</div>
+              <div>
+                <span class="stat-value" id="temp-val-${cardId}">—</span>
+                <span class="stat-unit">°C</span>
+              </div>
+            </div>
+          `;
+        }).join('');
+      }
+
+      // Update values
+      sensors.forEach(s => {
+        const cardId = 'temp-card-' + btoa(unescape(encodeURIComponent(s.sensor_id))).replace(/[^a-zA-Z0-9]/g,'');
+        const valEl = document.getElementById('temp-val-' + cardId);
+        flashValue(valEl, fmtTemp(s.temp));
+      });
+    }
+
+    async function applyNow() {
+      const btn = document.getElementById('apply-btn');
+      btn.disabled = true;
+      btn.textContent = 'Applying…';
+      try {
+        await api('POST', '/apply');
+        showToast('Applied — fans updated', 'ok');
+        await loadState();
+      } catch (e) {
+        showToast('Apply failed: ' + e.message, 'error');
+      } finally {
+        btn.disabled = false;
+        btn.textContent = '▶ Apply Now';
+      }
+    }
+
+    loadState();
+    setInterval(loadState, 10000);
+  </script>
+</body>
+</html>
+
