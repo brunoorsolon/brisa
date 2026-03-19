@@ -1,7 +1,7 @@
 services:
   brisa:
     image: brisa:latest
-    build: ./brisa
+    build: brisa/
     container_name: brisa
     restart: unless-stopped
     privileged: true

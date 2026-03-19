@@ -48,7 +48,7 @@ Hardware access is required — there is no simulation mode.
 ## Quick Start
 
 ```bash
-git clone https://github.com/youruser/brisa.git
+git clone https://github.com/brunoorsolon/brisa.git
 cd brisa
 docker build -t brisa:latest .
 docker compose up -d
@@ -95,7 +95,7 @@ Example `docker-compose.yml`:
 services:
   brisa:
     image: brisa:latest
-    build: ./brisa
+    build: brisa/
     container_name: brisa
     restart: unless-stopped
     privileged: true

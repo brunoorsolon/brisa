@@ -360,7 +360,7 @@ services:
     ports:
       - "9595:9595"
     volumes:
-      - /mnt/fast/docker/brisa:/data
+      - /docker/brisa:/data
 ```
 
 ### Volume layout
@@ -409,5 +409,4 @@ The Dockerfile uses a multi-stage build. Build tools (`make`, `gcc`, `libc-dev`)
 - [ ] Hysteresis support in curves (fans only spin down below X, only spin up above Y)
 - [ ] Multi-device support (multiple liquidctl controllers simultaneously)
 - [ ] Auth on the web UI (basic auth option)
-- [ ] Fan RPM also exposed in Prometheus metrics (currently only temp and fan %)
 - [ ] NVMe and other PCI sensor hwmon numbers are stable in practice but not guaranteed — WWID-style stable IDs for those sensors would be a future improvement
