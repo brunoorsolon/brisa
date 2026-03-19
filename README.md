@@ -1,4 +1,6 @@
-# Brisa
+<p align="center">
+  <img src="brisa/app/static/logo_text.png" width="250">
+</p>
 
 Brisa is a self-contained Docker service for controlling USB fan controllers on TrueNAS SCALE (and any other Linux host where you can run Docker but can't install packages directly).
 
