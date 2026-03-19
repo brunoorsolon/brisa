@@ -49,8 +49,7 @@ Hardware access is required — there is no simulation mode.
 
 ```bash
 git clone https://github.com/brunoorsolon/brisa.git
-cd brisa
-docker build -t brisa:latest .
+docker build -t brisa:latest brisa/
 docker compose up -d
 ```
 
