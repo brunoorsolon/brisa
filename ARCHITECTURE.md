@@ -1,7 +1,7 @@
 # Fan Control Service — Architecture Document
 
-**Status:** v0.1.0 — implemented and running
-**Last Updated:** March 17, 2026
+**Status:** v0.2.0 — implemented and running
+**Last Updated:** March 20, 2026
 
 ---
 
@@ -20,6 +20,7 @@ This project solves exactly that problem: a self-contained Docker-based fan cont
 - TrueNAS SCALE as the primary target platform
 - Any Linux host where Docker runs with USB access
 - Temperature sources: any sensor exposed via `/sys/class/hwmon` (coretemp, drivetemp, nvme, etc.)
+- Virtual sensors: computed avg/min/max from groups of real sensors
 - Fan control: all output channels on any liquidctl-supported device
 
 **Out of scope:**
@@ -49,12 +50,14 @@ Single Docker container. Three logical components running together:
 │  │    Loop     │   │  (Web UI + REST API)     │ │
 │  │             │   │                          │ │
 │  │  reads temps│   │  /          → Web UI     │ │
-│  │  applies    │   │  /api/state → current    │ │
-│  │  curves     │   │  /api/history → SQLite   │ │
-│  │  calls      │   │  /api/config → R/W JSON  │ │
-│  │  liquidctl  │   │  /api/apply → force loop │ │
-│  └──────┬──────┘   │  /api/metrics → Prom.    │ │
-│         │          └──────────────────────────┘ │
+│  │  resolves   │   │  /api/state → grouped    │ │
+│  │  virtual    │   │  /api/history → SQLite   │ │
+│  │  sensors    │   │  /api/config → R/W JSON  │ │
+│  │  applies    │   │  /api/apply → force loop │ │
+│  │  curves     │   │  /api/devices → detect   │ │
+│  │  calls      │   │  /api/metrics → Prom.    │ │
+│  │  liquidctl  │   │                          │ │
+│  └──────┬──────┘   └──────────────────────────┘ │
 │         │                                       │
 │  ┌──────▼──────────────────────────────────────┐│
 │  │              SQLite Database                ││
@@ -62,7 +65,7 @@ Single Docker container. Three logical components running together:
 │  └─────────────────────────────────────────────┘│
 │                                                 │
 │  Volumes:                                       │
-│    /data/config.json  ← curves, fan assignments │
+│    /data/config.json  ← full config             │
 │    /data/history.db   ← SQLite                  │
 │  Devices:                                       │
 │    /dev/bus/usb (privileged)                    │
@@ -121,13 +124,42 @@ The controller loop runs as an asyncio background task inside the Uvicorn proces
       "fan_id": "fan1",
       "fan_label": "Upper rear left",
       "curve_name": "silent",
-      "sensor_id": "drivetemp-wwid-naa.5000000000000001/sda — WDC WD120XXXX",
+      "sensor_id": "virtual/all-drives-max",
       "override_percent": null
     }
   ],
   "sensor_aliases": {
     "nvme-hwmon1/Sensor 1": "NVMe Boot Drive",
     "drivetemp-hwmon5/sda — WDC WD120XXXX": "NAS Drive 1"
+  },
+  "virtual_sensors": [
+    {
+      "id": "virtual/all-drives-max",
+      "name": "All Drives Max",
+      "source_sensor_ids": [
+        "drivetemp-wwid-naa.5000000000000001/sda — WDC WD120XXXX",
+        "drivetemp-wwid-naa.5000000000000002/sdb — WDC WD120XXXX"
+      ],
+      "aggregation": "max"
+    }
+  ],
+  "dashboard_groups": [
+    {
+      "id": "grp-exhaust-m4k1a",
+      "name": "Exhaust",
+      "type": "fan",
+      "item_ids": ["fan1", "fan2"]
+    },
+    {
+      "id": "grp-cpu-b7x2p",
+      "name": "CPU",
+      "type": "sensor",
+      "item_ids": ["coretemp-hwmon0/Core 0", "coretemp-hwmon0/Core 1"]
+    }
+  ],
+  "card_colors": {
+    "fan1": "teal",
+    "virtual/all-drives-max": "amber"
   }
 }
 ```
@@ -135,6 +167,12 @@ The controller loop runs as an asyncio background task inside the Uvicorn proces
 **`override_percent`** — when set to an integer, the controller applies that fixed speed to the fan every loop iteration, bypassing the sensor read, curve interpolation, and safety floor entirely. The curve and sensor assignments are preserved so they can be restored by clearing the override.
 
 **`sensor_aliases`** — display-only map from sensor ID to a human-readable name. The raw sensor ID is used internally everywhere; aliases are applied at the UI/API layer only. Unused aliases (sensors that have disappeared) are silently ignored.
+
+**`virtual_sensors`** — computed sensors that aggregate multiple real sensors. Each has a slug-like ID prefixed with `virtual/`, a display name, a list of source sensor IDs, and an aggregation mode (`avg`, `min`, `max`). Virtual sensors can be used as `sensor_id` in `fan_configs` just like real sensors. Nesting is not allowed — source sensors must be real hwmon sensors. If some source sensors are unavailable, the virtual sensor computes from whatever sources are present; it only fails (triggering safety floor) when all sources are missing.
+
+**`dashboard_groups`** — ordered list of named groups for the dashboard. Each group has a `type` (`sensor` or `fan`) and a list of `item_ids` that belong to it. Groups are displayed in list order. Items not in any group appear in an "Ungrouped" section at the bottom. If no groups are defined, the dashboard falls back to showing all configured fans and their associated sensors (backward compatible).
+
+**`card_colors`** — optional map from sensor or fan ID to a color key. Valid colors: `teal`, `blue`, `purple`, `pink`, `amber`, `orange`, `red`, `slate`. Colors render as a left-border accent on dashboard cards. Items without a color assignment have no accent border.
 
 ### SQLite schema
 
@@ -157,6 +195,31 @@ CREATE INDEX idx_fan_readings_ts ON fan_readings(ts);
 ```
 
 Old rows are pruned on each loop iteration based on `history_days` setting.
+
+---
+
+## Virtual Sensors
+
+Virtual sensors are resolved in `controller.py` via `resolve_virtual_sensors()`, called once per loop iteration before curve interpolation.
+
+**Resolution rules:**
+- For each virtual sensor, collect temperatures from all source sensors present in the current hwmon scan
+- If at least one source has a reading, compute the aggregation (avg/min/max) from available sources
+- If all sources are missing, the virtual sensor produces no value — the controller treats this as a missing sensor and applies the safety floor
+- Missing individual sources are logged at `debug` level; all-missing is logged at `warning` level
+
+**Validation rules (enforced on `POST /api/config`):**
+- At least 2 source sensors required
+- All source sensors must be currently detected real hwmon sensors
+- No referencing other virtual sensors (no nesting)
+- No duplicate virtual sensor IDs
+- Aggregation must be `avg`, `min`, or `max`
+
+Virtual sensors appear in:
+- `/api/devices` response (under `virtual_sensors` key, with computed temps)
+- `/api/state` response (in sensor groups or ungrouped sensors, with computed temps)
+- `/api/metrics` output (with `sensor="virtual"` label)
+- Fan config sensor selector in the UI (under a `── Virtual Sensors ──` separator)
 
 ---
 
@@ -190,22 +253,67 @@ No hardcoded sensor or fan names anywhere in the codebase.
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| GET | `/api/state` | Current temps, fan speeds, applied percentages, override status |
+| GET | `/api/state` | Grouped dashboard data: sensor_groups, fan_groups, ungrouped_sensors, ungrouped_fans — each item includes color |
 | GET | `/api/history` | Time series; params: `hours` (default 24) |
-| GET | `/api/config` | Full config (curves + fan assignments + settings + aliases) |
+| GET | `/api/config` | Full config (curves + fan assignments + settings + aliases + virtual sensors + groups + colors) |
 | POST | `/api/config` | Save new config; validated against currently detected devices before write |
-| GET | `/api/devices` | All detected sensors (with aliases) and fans |
+| GET | `/api/devices` | All detected sensors (with aliases), virtual sensors (with computed temps), and fans |
 | POST | `/api/apply` | Trigger immediate controller loop iteration; does not affect loop timer |
-| GET | `/api/metrics` | Prometheus text format |
+| GET | `/api/metrics` | Prometheus text format (includes virtual sensors with `sensor="virtual"`) |
 | GET | `/docs` | Auto-generated OpenAPI docs (FastAPI built-in) |
+
+### /api/state response structure
+
+```json
+{
+  "fan_groups": [
+    {
+      "id": "grp-exhaust-m4k1a",
+      "name": "Exhaust",
+      "items": [
+        {
+          "id": "fan1",
+          "label": "Upper rear left",
+          "current_rpm": 850.0,
+          "override_percent": null,
+          "last_percent": 45,
+          "color": "teal"
+        }
+      ]
+    }
+  ],
+  "sensor_groups": [
+    {
+      "id": "grp-cpu-b7x2p",
+      "name": "CPU",
+      "items": [
+        {
+          "sensor_id": "coretemp-hwmon0/Core 0",
+          "alias": "CPU Core 0",
+          "temp": 42.0,
+          "virtual": false,
+          "color": null
+        }
+      ]
+    }
+  ],
+  "ungrouped_fans": [],
+  "ungrouped_sensors": []
+}
+```
 
 ### Config validation
 
 `POST /api/config` validates against currently detected devices before writing:
 - Every `fan_config.curve_name` must exist in `curves`
-- Every `fan_config.sensor_id` must be in the currently detected sensor list
+- Every `fan_config.sensor_id` must be a currently detected sensor or a defined virtual sensor
 - Every `fan_config.fan_id` must be in the currently detected fan list
 - Every curve must have at least 2 points in ascending temperature order
+- Virtual sensors must have at least 2 source sensors, all real and currently detected
+- Virtual sensors cannot reference other virtual sensors
+- No duplicate virtual sensor IDs or dashboard group IDs
+- Card colors must be from the valid set: teal, blue, purple, pink, amber, orange, red, slate
+- Dashboard group types must be `sensor` or `fan`
 
 Hard reject on any violation. The validation cache is the live device scan at request time.
 
@@ -215,30 +323,39 @@ Hard reject on any violation. The validation cache is the live device scan at re
 # HELP brisa_temperature_celsius Current temperature reading
 # TYPE brisa_temperature_celsius gauge
 brisa_temperature_celsius{sensor="coretemp",label="Package id 0"} 38.0
+brisa_temperature_celsius{sensor="virtual",label="All Drives Max"} 45.0
 
 # HELP brisa_fan_rpm Current fan RPM
 # TYPE brisa_fan_rpm gauge
 brisa_fan_rpm{fan="fan1",label="Upper rear left"} 850.0
 ```
 
-Aliases are applied to labels in the metrics output when set.
+Aliases are applied to labels in the metrics output when set. Virtual sensors use `sensor="virtual"`.
 
 ---
 
 ## Web UI Pages
 
 ### Dashboard
-- Current RPM and applied % per configured fan
-- Current temperature per configured sensor (alias shown if set)
-- Live dot + polling every 10 seconds
+- Organized into **categories** (Fan Speeds, Temperatures) with uppercase section labels and a dividing line
+- Within each category, **named groups** are displayed with a teal accent bar and group title
+- Items not in any group appear under "Other" at the bottom of each category
+- If no groups are defined, falls back to flat display of all configured fans and sensors
+- Card accent colors rendered as a left border per card
+- `VIRTUAL` badge on virtual sensor cards
 - `MANUAL` badge on fan cards when override is active
+- Current RPM and applied % per fan; current temperature per sensor
+- Live dot + polling every 10 seconds
 - "Apply Now" button → POST /api/apply
 
 ### Sensors & Fans
 - All detected sensors with driver, sensor ID, current temperature
-- Inline alias editing per sensor row (click ✎, type alias, Enter or Save)
+- Inline alias editing per sensor row (click ✎ on the left, type alias, Enter or Save)
 - Alias shown as primary label; original sensor ID always visible below it
-- All detected fan channels with current RPM
+- **Color picker** per sensor and fan row — 8 color dots + "none"
+- **Virtual Sensors** section — create, edit, delete; select aggregation mode and source sensors
+- All detected fan channels with current RPM and color picker
+- **Dashboard Groups** section at the bottom — create sensor or fan groups, assign items, reorder with ▲/▼
 
 ### Curves
 - List of defined curves with Chart.js line preview
@@ -250,7 +367,8 @@ Aliases are applied to labels in the metrics output when set.
 
 ### Fan Configuration
 - Table of fan assignments with override status column
-- Add / Edit modal: fan selector, label, sensor selector (shows alias if set), curve selector
+- Sensor column shows virtual sensor names when applicable
+- Add / Edit modal: fan selector, label, sensor selector (real sensors + virtual sensors under separator), curve selector
 - Manual override toggle: when enabled, a fixed percent input replaces curve control
 - Override bypasses sensor read, curve interpolation, and safety floor entirely
 
@@ -279,13 +397,19 @@ on startup:
   start asyncio background task
 
 every interval_seconds:
-  scan all hwmon sensors once (single pass for all fans)
+  scan all hwmon sensors once (single pass)
+  resolve virtual sensors from real sensor readings:
+    for each virtual sensor:
+      collect temps from available source sensors
+      if at least one source present: compute avg/min/max
+      if all sources missing: skip (no value produced)
+  merge real + virtual sensor maps
   for each fan_config:
     if override_percent is set:
       apply override_percent (no sensor read, no curve, no safety floor)
     else:
-      read temp from sensor_id via hwmon scan result
-      if sensor not found:
+      read temp from merged sensor map
+      if sensor not found (real missing, or virtual with all sources missing):
         apply safety_floor_percent
         log warning
         continue
@@ -298,9 +422,9 @@ every interval_seconds:
   prune old rows (> history_days)
 ```
 
-**Safety floor semantics:** the safety floor is a fallback for sensor failure only. It is never applied to manually overridden fans.
+**Safety floor semantics:** the safety floor is a fallback for sensor failure only. It is never applied to manually overridden fans. For virtual sensors, it triggers only when all source sensors are unavailable.
 
-**Single sensor scan per iteration:** `detect_sensors()` is called once per loop iteration, not once per fan. The result is shared across all fan configs in that iteration.
+**Single sensor scan per iteration:** `detect_sensors()` is called once per loop iteration, not once per fan. The result is shared across all fan configs in that iteration. Virtual sensor resolution also happens once, before the per-fan loop.
 
 Interpolation is linear between each adjacent pair of curve points. Below the first point, the first point's percent is used. Above the last point, the last point's percent is used.
 
@@ -319,25 +443,25 @@ brisa/
 │   ├── requirements.txt
 │   └── app/
 │       ├── main.py              ← FastAPI app, lifespan, global config/loop state
-│       ├── models.py            ← Pydantic models (AppConfig, FanConfig, Curve, etc.)
-│       ├── config.py            ← load/save/validate config.json
-│       ├── controller.py        ← loop logic, interpolation, _last_applied cache
+│       ├── models.py            ← Pydantic models (AppConfig, FanConfig, Curve, VirtualSensor, DashboardGroup, etc.)
+│       ├── config.py            ← load/save/validate config.json (incl. virtual sensor + group + color validation)
+│       ├── controller.py        ← loop logic, interpolation, virtual sensor resolution, _last_applied cache
 │       ├── hwmon.py             ← /sys/class/hwmon reader + drivetemp enrichment
 │       ├── liquidctl_wrapper.py ← subprocess wrapper for liquidctl
 │       ├── database.py          ← SQLite init, read/write, prune
 │       ├── api/
-│       │   └── routes.py        ← all API endpoints
+│       │   └── routes.py        ← all API endpoints (grouped state, virtual sensor dicts, card colors)
 │       └── static/              ← vanilla JS + HTML pages
-│           ├── style.css
+│           ├── style.css         ← theme, card colors, dashboard group/category styles
 │           ├── app.js
 │           ├── logo.png
 │           ├── logo_text.png
 │           ├── favicon.png
 │           ├── favicon.ico
-│           ├── index.html        ← Dashboard
-│           ├── devices.html      ← Sensors & Fans
+│           ├── index.html        ← Dashboard (grouped layout, card colors)
+│           ├── devices.html      ← Sensors & Fans (aliases, colors, virtual sensors, dashboard groups)
 │           ├── curves.html       ← Curves
-│           ├── fanconfig.html    ← Fan Configuration
+│           ├── fanconfig.html    ← Fan Configuration (virtual sensor support in selector)
 │           ├── history.html      ← History
 │           └── settings.html     ← Settings
 └── tests/
@@ -367,7 +491,7 @@ services:
 
 ```
 /data/
-  config.json    ← curves, fan assignments, settings, aliases (created with defaults if missing)
+  config.json    ← curves, fan assignments, settings, aliases, virtual sensors, groups, colors
   history.db     ← SQLite database
 ```
 

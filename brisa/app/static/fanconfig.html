@@ -161,6 +161,18 @@
       }
     }
 
+    function sensorDisplayName(sensorId) {
+      // Check aliases first
+      if (config.sensor_aliases && config.sensor_aliases[sensorId]) {
+        return config.sensor_aliases[sensorId];
+      }
+      // Check virtual sensors
+      const vs = (config.virtual_sensors || []).find(v => v.id === sensorId);
+      if (vs) return vs.name + ' [virtual]';
+      // Fallback to last segment
+      return sensorId.split('/').pop();
+    }
+
     function render() {
       const tbody = document.getElementById('fanconfig-tbody');
       if (!config.fan_configs.length) {
@@ -175,7 +187,7 @@
           <tr>
             <td><span class="mono" style="font-size:12px">${fc.fan_id}</span></td>
             <td>${fc.fan_label || '—'}</td>
-            <td><span class="mono" style="font-size:11px;color:var(--text-dim)">${(config.sensor_aliases && config.sensor_aliases[fc.sensor_id]) || fc.sensor_id.split('/').pop()}</span></td>
+            <td><span class="mono" style="font-size:11px;color:var(--text-dim)">${sensorDisplayName(fc.sensor_id)}</span></td>
             <td>${isOverride
               ? '<span class="badge badge-dim" style="text-decoration:line-through">' + fc.curve_name + '</span>'
               : '<span class="badge badge-green">' + fc.curve_name + '</span>'
@@ -210,10 +222,24 @@
         `<option value="${f.id}" ${existing?.fan_id === f.id ? 'selected' : ''}>${f.label}</option>`
       ).join('');
 
-      sensorSel.innerHTML = (devices.sensors || []).map(s => {
+      // Real sensors
+      let sensorOptions = (devices.sensors || []).map(s => {
           const display = s.alias ? s.alias + ' (' + s.id + ')' : s.label;
           return `<option value="${s.id}" ${existing?.sensor_id === s.id ? 'selected' : ''}>${display}</option>`;
-        }).join('');
+        });
+
+      // Virtual sensors
+      const vsOptions = (devices.virtual_sensors || []).map(vs => {
+          const display = vs.label + ' [virtual]';
+          return `<option value="${vs.id}" ${existing?.sensor_id === vs.id ? 'selected' : ''}>${display}</option>`;
+        });
+
+      if (vsOptions.length) {
+        sensorOptions.push('<option disabled>── Virtual Sensors ──</option>');
+        sensorOptions = sensorOptions.concat(vsOptions);
+      }
+
+      sensorSel.innerHTML = sensorOptions.join('');
 
       curveSel.innerHTML = (config.curves || []).map(c =>
         `<option value="${c.name}" ${existing?.curve_name === c.name ? 'selected' : ''}>${c.name}</option>`
@@ -307,4 +333,3 @@
   </script>
 </body>
 </html>
-

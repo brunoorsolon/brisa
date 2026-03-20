@@ -54,6 +54,10 @@ def save_config(config: AppConfig) -> None:
         raise
 
 
+# Curated card color keys — must match frontend CARD_COLORS map
+VALID_CARD_COLORS = {"teal", "blue", "purple", "pink", "amber", "orange", "red", "slate"}
+
+
 def validate_config(config: AppConfig, known_sensor_ids: list[str], known_fan_ids: list[str]) -> list[str]:
     """
     Validate config against currently detected devices.
@@ -62,12 +66,46 @@ def validate_config(config: AppConfig, known_sensor_ids: list[str], known_fan_id
     errors = []
     curve_names = {c.name for c in config.curves}
 
+    # Build the set of all valid sensor IDs: real + virtual
+    virtual_sensor_ids = {vs.id for vs in config.virtual_sensors}
+    all_sensor_ids = set(known_sensor_ids) | virtual_sensor_ids
+
+    # Validate virtual sensors
+    for vs in config.virtual_sensors:
+        if not vs.id:
+            errors.append("Virtual sensor has empty ID")
+        if vs.aggregation not in ("avg", "min", "max"):
+            errors.append(
+                f"Virtual sensor '{vs.id}' has invalid aggregation '{vs.aggregation}' (must be avg, min, or max)"
+            )
+        if len(vs.source_sensor_ids) < 2:
+            errors.append(
+                f"Virtual sensor '{vs.id}' must reference at least 2 source sensors"
+            )
+        for src_id in vs.source_sensor_ids:
+            if src_id not in known_sensor_ids:
+                errors.append(
+                    f"Virtual sensor '{vs.id}' references unknown sensor '{src_id}'"
+                )
+            if src_id in virtual_sensor_ids:
+                errors.append(
+                    f"Virtual sensor '{vs.id}' cannot reference another virtual sensor '{src_id}'"
+                )
+
+    # Check for duplicate virtual sensor IDs
+    seen_vs_ids = set()
+    for vs in config.virtual_sensors:
+        if vs.id in seen_vs_ids:
+            errors.append(f"Duplicate virtual sensor ID '{vs.id}'")
+        seen_vs_ids.add(vs.id)
+
+    # Validate fan configs — sensor_id can now be a virtual sensor
     for fan_cfg in config.fan_configs:
         if fan_cfg.curve_name not in curve_names:
             errors.append(
                 f"Fan '{fan_cfg.fan_id}' references unknown curve '{fan_cfg.curve_name}'"
             )
-        if fan_cfg.sensor_id not in known_sensor_ids:
+        if fan_cfg.sensor_id not in all_sensor_ids:
             errors.append(
                 f"Fan '{fan_cfg.fan_id}' references unknown sensor '{fan_cfg.sensor_id}'"
             )
@@ -87,5 +125,23 @@ def validate_config(config: AppConfig, known_sensor_ids: list[str], known_fan_id
                 errors.append(
                     f"Curve '{curve.name}' points must be in ascending temperature order"
                 )
+
+    # Validate dashboard groups
+    seen_group_ids = set()
+    for grp in config.dashboard_groups:
+        if grp.id in seen_group_ids:
+            errors.append(f"Duplicate dashboard group ID '{grp.id}'")
+        seen_group_ids.add(grp.id)
+        if grp.type not in ("sensor", "fan"):
+            errors.append(
+                f"Dashboard group '{grp.name}' has invalid type '{grp.type}' (must be sensor or fan)"
+            )
+
+    # Validate card colors
+    for item_id, color in config.card_colors.items():
+        if color not in VALID_CARD_COLORS:
+            errors.append(
+                f"Card color '{color}' for '{item_id}' is not valid (must be one of {VALID_CARD_COLORS})"
+            )
 
     return errors

@@ -25,9 +25,25 @@ class FanConfig(BaseModel):
     override_percent: int | None = None
 
 
+class VirtualSensor(BaseModel):
+    id: str
+    name: str
+    source_sensor_ids: list[str]
+    aggregation: str  # "avg", "min", "max"
+
+
+class DashboardGroup(BaseModel):
+    id: str
+    name: str
+    type: str  # "sensor" or "fan"
+    item_ids: list[str] = []
+
+
 class AppConfig(BaseModel):
     settings: Settings = Settings()
     curves: list[Curve] = []
     fan_configs: list[FanConfig] = []
     sensor_aliases: dict[str, str] = {}
-
+    virtual_sensors: list[VirtualSensor] = []
+    dashboard_groups: list[DashboardGroup] = []
+    card_colors: dict[str, str] = {}  # sensor/fan ID → color key

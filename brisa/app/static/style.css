@@ -382,6 +382,98 @@ input, select, textarea { font-family: var(--font-ui); }
   color: var(--text);
 }
 
+/* ── Dashboard group sections ──────────────────────────── */
+.dash-group {
+  margin-bottom: 24px;
+}
+
+.dash-group-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 14px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--border-dim);
+}
+
+.dash-group-title {
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: -0.2px;
+  color: var(--text);
+}
+
+.dash-group-accent {
+  width: 3px;
+  height: 18px;
+  border-radius: 2px;
+  background: var(--accent);
+  flex-shrink: 0;
+}
+
+.dash-category {
+  margin-bottom: 32px;
+}
+
+.dash-category-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 16px;
+}
+
+.dash-category-title {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.dash-category-line {
+  flex: 1;
+  height: 1px;
+  background: var(--border-dim);
+}
+
+/* ── Card accent colors ────────────────────────────────── */
+.stat-card[data-color="teal"]   { border-left: 3px solid #00d4aa; }
+.stat-card[data-color="blue"]   { border-left: 3px solid #60a5fa; }
+.stat-card[data-color="purple"] { border-left: 3px solid #a78bfa; }
+.stat-card[data-color="pink"]   { border-left: 3px solid #f472b6; }
+.stat-card[data-color="amber"]  { border-left: 3px solid #f59e0b; }
+.stat-card[data-color="orange"] { border-left: 3px solid #fb923c; }
+.stat-card[data-color="red"]    { border-left: 3px solid #ef4444; }
+.stat-card[data-color="slate"]  { border-left: 3px solid #64748b; }
+
+/* Color dot used in pickers */
+.color-dot {
+  display: inline-block;
+  width: 14px; height: 14px;
+  border-radius: 50%;
+  cursor: pointer;
+  border: 2px solid transparent;
+  transition: border-color var(--transition), transform var(--transition);
+}
+
+.color-dot:hover { transform: scale(1.2); }
+.color-dot.selected { border-color: var(--text); }
+.color-dot[data-color="teal"]   { background: #00d4aa; }
+.color-dot[data-color="blue"]   { background: #60a5fa; }
+.color-dot[data-color="purple"] { background: #a78bfa; }
+.color-dot[data-color="pink"]   { background: #f472b6; }
+.color-dot[data-color="amber"]  { background: #f59e0b; }
+.color-dot[data-color="orange"] { background: #fb923c; }
+.color-dot[data-color="red"]    { background: #ef4444; }
+.color-dot[data-color="slate"]  { background: #64748b; }
+.color-dot[data-color=""]       { background: var(--border); }
+
+.color-picker-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
 /* ── Live dot ───────────────────────────────────────────── */
 .live-dot {
   display: inline-block;

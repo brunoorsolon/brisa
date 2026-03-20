@@ -28,12 +28,62 @@ def interpolate(points: list[dict], temp: float) -> int:
     return points[-1]["percent"]
 
 
+def resolve_virtual_sensors(
+    virtual_sensors: list,
+    real_sensor_map: dict[str, float],
+) -> dict[str, float]:
+    """
+    Compute virtual sensor temperatures from real sensor readings.
+
+    Returns a dict of virtual_sensor_id -> computed_temp.
+    Uses whichever source sensors are available. Only skips if ALL sources are missing.
+    """
+    results: dict[str, float] = {}
+
+    for vs in virtual_sensors:
+        temps = []
+        for src_id in vs.source_sensor_ids:
+            temp = real_sensor_map.get(src_id)
+            if temp is None:
+                logger.debug(
+                    "Virtual sensor '%s': source sensor '%s' not found, ignoring",
+                    vs.id, src_id,
+                )
+            else:
+                temps.append(temp)
+
+        if not temps:
+            logger.warning(
+                "Virtual sensor '%s': all source sensors missing, skipping",
+                vs.id,
+            )
+            continue
+
+        if vs.aggregation == "avg":
+            results[vs.id] = sum(temps) / len(temps)
+        elif vs.aggregation == "min":
+            results[vs.id] = min(temps)
+        elif vs.aggregation == "max":
+            results[vs.id] = max(temps)
+        else:
+            logger.warning(
+                "Virtual sensor '%s': unknown aggregation '%s'",
+                vs.id, vs.aggregation,
+            )
+
+    return results
+
+
 async def run_once(config) -> None:
     ts = int(time.time())
     curve_map = {c.name: c for c in config.curves}
 
     all_sensors = detect_sensors()
-    sensor_map = {s["id"]: s["current_temp"] for s in all_sensors}
+    real_sensor_map = {s["id"]: s["current_temp"] for s in all_sensors}
+
+    # Resolve virtual sensors and merge into the sensor map
+    virtual_temps = resolve_virtual_sensors(config.virtual_sensors, real_sensor_map)
+    sensor_map = {**real_sensor_map, **virtual_temps}
 
     fan_results: list[dict] = []
     sensor_temps: dict[str, float] = {}
@@ -114,4 +164,3 @@ async def loop() -> None:
         except Exception as e:
             logger.error("Unhandled error in controller loop: %s", e, exc_info=True)
         await asyncio.sleep(config.settings.interval_seconds)
-

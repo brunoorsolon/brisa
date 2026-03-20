@@ -3,7 +3,7 @@ import logging
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import PlainTextResponse
 
-from app.controller import _last_applied
+from app.controller import _last_applied, resolve_virtual_sensors
 from app.database import query_history
 from app.hwmon import detect_sensors
 from app.liquidctl_wrapper import get_fan_status
@@ -30,23 +30,46 @@ def _apply_aliases(sensors: list[dict], aliases: dict[str, str]) -> list[dict]:
     return sensors
 
 
+def _build_virtual_sensor_dicts(config: AppConfig, real_sensor_map: dict[str, float]) -> list[dict]:
+    """Build sensor-like dicts for virtual sensors with computed temps."""
+    virtual_temps = resolve_virtual_sensors(config.virtual_sensors, real_sensor_map)
+    result = []
+    for vs in config.virtual_sensors:
+        result.append({
+            "id": vs.id,
+            "driver": "virtual",
+            "label": vs.name,
+            "current_temp": virtual_temps.get(vs.id),
+            "alias": config.sensor_aliases.get(vs.id),
+            "virtual": True,
+            "aggregation": vs.aggregation,
+            "source_sensor_ids": vs.source_sensor_ids,
+        })
+    return result
+
+
 @router.get("/state")
 async def get_state():
     config = _get_app_config()
 
     all_sensors = detect_sensors()
-    sensor_map = {s["id"]: s["current_temp"] for s in all_sensors}
+    real_sensor_map = {s["id"]: s["current_temp"] for s in all_sensors}
 
-    sensors_out = []
-    seen_sensors = set()
-    for fan_cfg in config.fan_configs:
-        if fan_cfg.sensor_id not in seen_sensors:
-            seen_sensors.add(fan_cfg.sensor_id)
-            sensors_out.append({
-                "sensor_id": fan_cfg.sensor_id,
-                "alias": config.sensor_aliases.get(fan_cfg.sensor_id),
-                "temp": sensor_map.get(fan_cfg.sensor_id),
-            })
+    # Resolve virtual sensors
+    virtual_temps = resolve_virtual_sensors(config.virtual_sensors, real_sensor_map)
+    sensor_map = {**real_sensor_map, **virtual_temps}
+
+    vs_map = {vs.id: vs for vs in config.virtual_sensors}
+
+    def build_sensor_dict(sid):
+        vs = vs_map.get(sid)
+        return {
+            "sensor_id": sid,
+            "alias": config.sensor_aliases.get(sid) or (vs.name if vs else None),
+            "temp": sensor_map.get(sid),
+            "virtual": sid in vs_map,
+            "color": config.card_colors.get(sid),
+        }
 
     try:
         fan_status = get_fan_status()
@@ -55,19 +78,68 @@ async def get_state():
         logger.warning("Could not fetch fan status: %s", e)
         rpm_map = {}
 
-    fans_out = []
-    for fan_cfg in config.fan_configs:
-        fans_out.append({
-            "id": fan_cfg.fan_id,
-            "label": fan_cfg.fan_label,
-            "current_rpm": rpm_map.get(fan_cfg.fan_id),
-            "override_percent": fan_cfg.override_percent,
-            "last_percent": _last_applied.get(fan_cfg.fan_id),
-        })
+    fan_cfg_map = {fc.fan_id: fc for fc in config.fan_configs}
+
+    def build_fan_dict(fan_id):
+        fc = fan_cfg_map.get(fan_id)
+        return {
+            "id": fan_id,
+            "label": fc.fan_label if fc else fan_id,
+            "current_rpm": rpm_map.get(fan_id),
+            "override_percent": fc.override_percent if fc else None,
+            "last_percent": _last_applied.get(fan_id),
+            "color": config.card_colors.get(fan_id),
+        }
+
+    # Build grouped output
+    # Track which items are in groups so we can find ungrouped ones
+    grouped_sensor_ids = set()
+    grouped_fan_ids = set()
+
+    sensor_groups = []
+    fan_groups = []
+
+    for grp in config.dashboard_groups:
+        if grp.type == "sensor":
+            items = []
+            for sid in grp.item_ids:
+                grouped_sensor_ids.add(sid)
+                items.append(build_sensor_dict(sid))
+            sensor_groups.append({
+                "id": grp.id,
+                "name": grp.name,
+                "items": items,
+            })
+        elif grp.type == "fan":
+            items = []
+            for fid in grp.item_ids:
+                grouped_fan_ids.add(fid)
+                items.append(build_fan_dict(fid))
+            fan_groups.append({
+                "id": grp.id,
+                "name": grp.name,
+                "items": items,
+            })
+
+    # Ungrouped: fan-config sensors and configured fans not in any group
+    ungrouped_sensors = []
+    seen = set()
+    for fc in config.fan_configs:
+        if fc.sensor_id not in grouped_sensor_ids and fc.sensor_id not in seen:
+            seen.add(fc.sensor_id)
+            ungrouped_sensors.append(build_sensor_dict(fc.sensor_id))
+
+    ungrouped_fans = []
+    for fc in config.fan_configs:
+        if fc.fan_id not in grouped_fan_ids and fc.fan_id not in seen:
+            seen.add(fc.fan_id)
+            ungrouped_fans.append(build_fan_dict(fc.fan_id))
 
     return {
-        "sensors": sensors_out,
-        "fans": fans_out,
+        "sensor_groups": sensor_groups,
+        "fan_groups": fan_groups,
+        "ungrouped_sensors": ungrouped_sensors,
+        "ungrouped_fans": ungrouped_fans,
     }
 
 
@@ -109,9 +181,15 @@ async def get_devices():
     config = _get_app_config()
     sensors = detect_sensors()
     _apply_aliases(sensors, config.sensor_aliases)
+
+    # Append virtual sensors
+    real_sensor_map = {s["id"]: s["current_temp"] for s in sensors}
+    virtual_sensor_dicts = _build_virtual_sensor_dicts(config, real_sensor_map)
+
     fans = get_fan_status()
     return {
         "sensors": sensors,
+        "virtual_sensors": virtual_sensor_dicts,
         "fans": fans,
     }
 
@@ -129,6 +207,9 @@ async def metrics():
     config = _get_app_config()
     sensors = detect_sensors()
     _apply_aliases(sensors, config.sensor_aliases)
+
+    real_sensor_map = {s["id"]: s["current_temp"] for s in sensors}
+
     fans = get_fan_status()
 
     lines = []
@@ -143,6 +224,15 @@ async def metrics():
             f'brisa_temperature_celsius{{sensor="{driver}",label="{display}"}} {s["current_temp"]}'
         )
 
+    # Virtual sensors in metrics
+    virtual_sensor_dicts = _build_virtual_sensor_dicts(config, real_sensor_map)
+    for vs in virtual_sensor_dicts:
+        if vs["current_temp"] is not None:
+            display = (vs.get("alias") or vs["label"]).replace('"', '\\"')
+            lines.append(
+                f'brisa_temperature_celsius{{sensor="virtual",label="{display}"}} {vs["current_temp"]}'
+            )
+
     lines.append("# HELP brisa_fan_rpm Current fan RPM")
     lines.append("# TYPE brisa_fan_rpm gauge")
     for f in fans:
@@ -153,4 +243,3 @@ async def metrics():
         )
 
     return PlainTextResponse("\n".join(lines) + "\n")
-
