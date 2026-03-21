@@ -51,6 +51,11 @@ async def lifespan(app: FastAPI):
     yield
 
     logger.info("Brisa shutting down")
+
+    # Restore hwmon-pwm fans to their original auto/firmware mode
+    from app import hwmon_pwm
+    hwmon_pwm.release_all()
+
     if _loop_task:
         _loop_task.cancel()
         try:
@@ -62,7 +67,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Brisa",
     description="Docker-based fan control service",
-    version="0.2.0",
+    version="0.3.0",
     lifespan=lifespan,
 )
 
@@ -71,11 +76,25 @@ app.include_router(router, prefix="/api")
 
 @app.get("/metrics", include_in_schema=False)
 async def metrics():
-    from app.hwmon import detect_sensors
+    from app.sensors import detect_sensors
     from app.liquidctl_wrapper import get_fan_status
+    from app import hwmon_pwm
 
     sensors = detect_sensors()
-    fans = get_fan_status()
+
+    fans = []
+    try:
+        fans.extend(get_fan_status())
+    except Exception:
+        pass
+
+    # Add hwmon-pwm fans with RPM readings
+    config = get_config()
+    for fc in config.fan_configs:
+        if fc.backend == "hwmon-pwm":
+            rpm = hwmon_pwm.get_fan_rpm(fc.fan_id)
+            if rpm is not None:
+                fans.append({"id": fc.fan_id, "label": fc.fan_label, "current_rpm": rpm})
 
     lines = []
 

@@ -1,7 +1,7 @@
 # Fan Control Service — Architecture Document
 
-**Status:** v0.2.0 — implemented and running
-**Last Updated:** March 20, 2026
+**Status:** v0.3.0 — implemented and running
+**Last Updated:** March 21, 2026
 
 ---
 
@@ -9,7 +9,7 @@
 
 TrueNAS SCALE locks down package management, making it impossible to install fan control software via standard system tools (`apt`, `pip`). Existing solutions like CoolerControl assume a general-purpose Linux environment. USB fan controllers with good Linux support rely on `liquidctl` to operate — which cannot be installed on TrueNAS natively.
 
-This project solves exactly that problem: a self-contained Docker-based fan control service for TrueNAS SCALE, targeting any fan controller supported by liquidctl and any temperature source exposed via hwmon. It is not a general-purpose fan control solution.
+This project solves exactly that problem: a self-contained Docker-based fan control service for TrueNAS SCALE, targeting any fan controller supported by liquidctl, any motherboard PWM fan header exposed via hwmon, and any temperature source exposed via hwmon. It is not a general-purpose fan control solution.
 
 ---
 
@@ -17,16 +17,16 @@ This project solves exactly that problem: a self-contained Docker-based fan cont
 
 **In scope:**
 - Any USB fan controller supported by liquidctl (Aquacomputer Quadro is the primary tested device)
+- Motherboard PWM fan headers exposed via `/sys/class/hwmon` (tested: Nuvoton NCT6687 Super I/O chip)
 - TrueNAS SCALE as the primary target platform
 - Any Linux host where Docker runs with USB access
 - Temperature sources: any sensor exposed via `/sys/class/hwmon` (coretemp, drivetemp, nvme, etc.)
 - Virtual sensors: computed avg/min/max from groups of real sensors
-- Fan control: all output channels on any liquidctl-supported device
+- Fan control: all output channels on any liquidctl-supported device, plus any writable `pwmN` sysfs channel
 
 **Out of scope:**
-- Controllers not supported by liquidctl
+- Controllers not supported by liquidctl or hwmon
 - General Linux fan control (CoolerControl, fancontrol, etc. solve that problem better on standard distros)
-- PWM headers directly on motherboard
 - Non-Docker deployments
 
 ---
@@ -55,8 +55,10 @@ Single Docker container. Three logical components running together:
 │  │  sensors    │   │  /api/config → R/W JSON  │ │
 │  │  applies    │   │  /api/apply → force loop │ │
 │  │  curves     │   │  /api/devices → detect   │ │
-│  │  calls      │   │  /api/metrics → Prom.    │ │
+│  │  routes to  │   │  /api/metrics → Prom.    │ │
+│  │  backend:   │   │                          │ │
 │  │  liquidctl  │   │                          │ │
+│  │  or sysfs   │   │                          │ │
 │  └──────┬──────┘   └──────────────────────────┘ │
 │         │                                       │
 │  ┌──────▼──────────────────────────────────────┐│
@@ -69,7 +71,7 @@ Single Docker container. Three logical components running together:
 │    /data/history.db   ← SQLite                  │
 │  Devices:                                       │
 │    /dev/bus/usb (privileged)                    │
-│    /sys/class/hwmon (read-only)                 │
+│    /sys/class/hwmon (read-write for PWM fans)  │
 └─────────────────────────────────────────────────┘
 ```
 
@@ -87,6 +89,7 @@ The controller loop runs as an asyncio background task inside the Uvicorn proces
 | Data validation | Pydantic 2.11.1 | Config validation and serialization |
 | Database | SQLite (stdlib) | No separate service, file-based, survives container restarts, more than adequate for time-series at minute intervals |
 | Fan control | liquidctl 1.13.0 (subprocess) | Only reliable way to control USB fan controllers on Linux; subprocess is intentional — no stable Python API exists |
+| Fan control | hwmon sysfs (direct write) | Controls motherboard PWM fan headers via `/sys/class/hwmon/hwmonN/pwmN`; no additional dependencies |
 | Frontend | Vanilla JS + Chart.js 4.4.0 | No framework needed for this scope; Chart.js handles all graphing; keeps image small |
 | Base image | python:3.12.9-slim | Minimal Debian base; pinned to exact patch version |
 
@@ -125,7 +128,16 @@ The controller loop runs as an asyncio background task inside the Uvicorn proces
       "fan_label": "Upper rear left",
       "curve_name": "silent",
       "sensor_id": "virtual/all-drives-max",
-      "override_percent": null
+      "override_percent": null,
+      "backend": "liquidctl"
+    },
+    {
+      "fan_id": "hwmon-pwm-nct6687.2592/pwm1",
+      "fan_label": "CPU Fan",
+      "curve_name": "silent",
+      "sensor_id": "k10temp-hwmon3/Tctl",
+      "override_percent": null,
+      "backend": "hwmon-pwm"
     }
   ],
   "sensor_aliases": {
@@ -165,6 +177,8 @@ The controller loop runs as an asyncio background task inside the Uvicorn proces
 ```
 
 **`override_percent`** — when set to an integer, the controller applies that fixed speed to the fan every loop iteration, bypassing the sensor read, curve interpolation, and safety floor entirely. The curve and sensor assignments are preserved so they can be restored by clearing the override.
+
+**`backend`** — determines how the fan is controlled. `"liquidctl"` for USB fan controllers (Aquacomputer Quadro, etc.), `"hwmon-pwm"` for motherboard PWM fan headers controlled via sysfs. The backend dictates which code path handles speed writes, RPM reads, and device lifecycle (initialization, shutdown).
 
 **`sensor_aliases`** — display-only map from sensor ID to a human-readable name. The raw sensor ID is used internally everywhere; aliases are applied at the UI/API layer only. Unused aliases (sensors that have disappeared) are silently ignored.
 
@@ -242,11 +256,23 @@ On startup (and via `GET /api/devices`), the service detects:
 
 **Config migration:** On startup, `load_config()` runs `migrate_drivetemp_ids()` which detects old-style drivetemp IDs containing a block device letter (e.g. `drivetemp-wwid-<WWID>/sda — <model>`) and rewrites them to the new format (`drivetemp-wwid-<WWID>/<model>`) across all config sections: `sensor_aliases`, `virtual_sensors`, `fan_configs`, `dashboard_groups`, and `card_colors`. If any IDs were migrated, the config is saved back to disk automatically. Each migrated ID is logged individually at INFO level.
 
-**Fans** — query liquidctl:
+**Fans (liquidctl backend)** — query liquidctl:
 - Run `liquidctl list --json` to find connected devices
 - Run `liquidctl --direct-access status --json` to enumerate fan channels and current RPM
 - Parse `Fan N speed` entries from the status output
-- Return structured list: `{ id, label, current_rpm }`
+- Return structured list: `{ id, label, current_rpm, backend: "liquidctl" }`
+- If no liquidctl devices are present, returns empty list (no error)
+
+**Fans (hwmon-pwm backend)** — scan `/sys/class/hwmon/hwmon*`:
+- For each hwmon device, skip if driver name matches a liquidctl-managed device (blocklist: `quadro`, `octo`, `d5next`, `kraken`, `smart_device`) to avoid duplicate detection
+- Check for `pwmN` and `pwmN_enable` files; skip if `pwmN` is not writable
+- Build a stable fan ID from the platform device path: `hwmon-pwm-<driver>.<address>/<pwmN>` (e.g. `hwmon-pwm-nct6687.2592/pwm1`). The hwmonN number is not used in the ID because it can change across reboots
+- Read `fanN_input` for current RPM, `fanN_label` for driver-provided label
+- Return structured list: `{ id, label, current_rpm, backend: "hwmon-pwm" }`
+
+**Why stable IDs for hwmon-pwm fans?** The kernel assigns `hwmonN` numbers at boot based on driver load order. The platform device component (e.g. `nct6687.2592`) is derived from the device's physical bus address and is stable across reboots — same approach as the WWID scheme used for drivetemp sensors.
+
+**Deduplication:** Some USB fan controllers (like the Aquacomputer Quadro) have both a liquidctl interface and a kernel hwmon driver (`aquacomputer_hwmon`). These expose the same fans through both paths. The hwmon-pwm scanner skips any hwmon device whose driver name is in the blocklist, ensuring each fan appears only once and is controlled by the more capable liquidctl backend.
 
 No hardcoded sensor or fan names anywhere in the codebase.
 
@@ -310,7 +336,8 @@ No hardcoded sensor or fan names anywhere in the codebase.
 `POST /api/config` validates against currently detected devices before writing:
 - Every `fan_config.curve_name` must exist in `curves`
 - Every `fan_config.sensor_id` must be a currently detected sensor or a defined virtual sensor
-- Every `fan_config.fan_id` must be in the currently detected fan list
+- Every `fan_config.fan_id` must be in the currently detected fan list (from either backend)
+- Every `fan_config.backend` must be `"liquidctl"` or `"hwmon-pwm"`
 - Every curve must have at least 2 points in ascending temperature order
 - Virtual sensors must have at least 2 source sensors, all real and currently detected
 - Virtual sensors cannot reference other virtual sensors
@@ -318,7 +345,7 @@ No hardcoded sensor or fan names anywhere in the codebase.
 - Card colors must be from the valid set: teal, blue, purple, pink, amber, orange, red, slate
 - Dashboard group types must be `sensor` or `fan`
 
-Hard reject on any violation. The validation cache is the live device scan at request time. All validation errors are logged at WARNING level (with the full error list and known sensor/fan IDs) before the 422 response is returned.
+Hard reject on any violation. The validation cache is the live device scan at request time — sensor detection is required (503 if it fails), but liquidctl and hwmon-pwm fan detection are independent and non-blocking (if either fails, the other still contributes its fans). All validation errors are logged at WARNING level (with the full error list and known sensor/fan IDs) before the 422 response is returned.
 
 ### /api/metrics format (Prometheus)
 
@@ -393,8 +420,9 @@ Aliases are applied to labels in the metrics output when set. Virtual sensors us
 on startup:
   load config.json
   init SQLite database
-  run liquidctl --direct-access initialize all
+  run liquidctl --direct-access initialize all (non-fatal if no devices)
   for each fan_config:
+    if backend is hwmon-pwm: take over fan (save original pwmN_enable, write 1)
     if override_percent is set: apply override_percent
     else: apply safety_floor_percent
   start asyncio background task
@@ -417,12 +445,19 @@ every interval_seconds:
         log warning
         continue
       compute percent via linear interpolation on curve points
-      clamp to max(computed, safety_floor_percent)
-      call liquidctl --direct-access set <fan_id> speed <percent>
+      route to backend:
+        liquidctl: call liquidctl --direct-access set <fan_id> speed <percent>
+        hwmon-pwm: write round(percent * 255 / 100) to /sys/class/hwmon/hwmonN/pwmN
       cache applied percent in memory (_last_applied dict)
+  collect RPMs from all backends (liquidctl status + fanN_input reads)
   write sensor readings to SQLite (deduplicated by sensor_id)
   write fan readings to SQLite (percent + RPM)
   prune old rows (> history_days)
+
+on graceful shutdown (SIGTERM / docker stop):
+  for each hwmon-pwm fan that was taken over:
+    restore original pwmN_enable value (e.g. 99 for nct6687 firmware mode)
+  cancel controller loop task
 ```
 
 **Safety floor semantics:** the safety floor is a fallback for sensor failure only. It is never applied to manually overridden fans. For virtual sensors, it triggers only when all source sensors are unavailable.
@@ -446,10 +481,11 @@ brisa/
 │   ├── requirements.txt
 │   └── app/
 │       ├── main.py              ← FastAPI app, lifespan, global config/loop state
-│       ├── models.py            ← Pydantic models (AppConfig, FanConfig, Curve, VirtualSensor, DashboardGroup, etc.)
+│       ├── models.py            ← Pydantic models (AppConfig, FanConfig with backend field, Curve, VirtualSensor, DashboardGroup, etc.)
 │       ├── config.py            ← load/save/validate config.json, drivetemp ID migration (incl. virtual sensor + group + color validation)
-│       ├── controller.py        ← loop logic, interpolation, virtual sensor resolution, _last_applied cache
-│       ├── hwmon.py             ← /sys/class/hwmon reader + drivetemp enrichment
+│       ├── controller.py        ← loop logic, backend routing, interpolation, virtual sensor resolution, _last_applied cache
+│       ├── sensors.py           ← /sys/class/hwmon temperature reader + drivetemp enrichment (renamed from hwmon.py)
+│       ├── hwmon_pwm.py         ← sysfs PWM fan detection, control, takeover/release lifecycle
 │       ├── liquidctl_wrapper.py ← subprocess wrapper for liquidctl
 │       ├── database.py          ← SQLite init, read/write, prune
 │       ├── api/
@@ -500,10 +536,25 @@ services:
 
 ### TrueNAS-specific notes
 
-- `privileged: true` required for USB access to the fan controller
+- `privileged: true` required for USB access to the fan controller and sysfs writes for hwmon-pwm fans
 - Do not use TrueNAS Apps UI — deploy via `docker compose` only
 - `truenas_admin` must be in docker group
 - `/data` should be on an NVMe pool, not spinning rust (SQLite = small random I/O)
+- hwmon-pwm fans require a Super I/O chip with a loaded kernel driver (e.g. `nct6775`, `it87`, `nct6687`); many NAS-specific boards (e.g. Topton N22) lack these chips
+
+### Podman deployment
+
+Podman runs rootless by default on most Linux distributions. Rootless mode uses a user namespace where `--privileged` does not grant real host root — sysfs writes will fail silently and hwmon-pwm fans will not be controllable.
+
+For hwmon-pwm fan control with Podman, run as real root:
+
+```bash
+sudo podman run --privileged -v /sys:/sys -p 9595:9595 -v /path/to/data:/data brisa:latest
+```
+
+The `-v /sys:/sys` bind mount may be needed with Podman even in rootful mode, as Podman's default sysfs mount can be read-only. Docker does not require this — its `--privileged` flag grants full sysfs access by default.
+
+If only using liquidctl (USB) fans, rootless Podman with `--privileged` is sufficient.
 
 ---
 
@@ -525,15 +576,60 @@ The Dockerfile uses a multi-stage build. Build tools (`make`, `gcc`, `libc-dev`)
 ## What This Is Not
 
 - Not a replacement for CoolerControl, fancontrol, or nbfc
-- Not a general-purpose fan control solution
-- Not designed for non-USB fan controllers (motherboard PWM headers are out of scope)
+- Not a general-purpose fan control solution — targets TrueNAS SCALE and Docker-based deployments
 - Not a full observability platform — use Prometheus + Grafana if you need that; `/api/metrics` gives you the integration point
 
 ---
 
-## Open Questions / v2 Backlog
+## Security Considerations
+
+### Privileged container
+
+Brisa requires `privileged: true` to access USB devices and sysfs. A privileged container has effectively root access to the host, including:
+
+- Full access to all host devices (`/dev/*`)
+- Ability to read and write any sysfs path (not just hwmon — also power management, PCI config, etc.)
+- Ability to mount filesystems and load kernel modules
+- Effectively equivalent to root on the host
+
+This is an inherent requirement for hardware fan control from within a container. There is no way to control USB fan controllers or write to sysfs PWM files without elevated privileges. The same privilege level is required by any containerized fan control solution.
+
+**Mitigation:** Brisa has no network-facing authentication, no outbound network calls, and no code execution features. The attack surface is limited to the REST API on port 9595. For homelab deployments on a trusted local network, the risk is low. Do not expose port 9595 to the internet.
+
+### hwmon-pwm sysfs writes
+
+The hwmon-pwm backend writes to `/sys/class/hwmon/hwmonN/pwmN` and `/sys/class/hwmon/hwmonN/pwmN_enable`. These writes only affect fan speed and control mode for the specific PWM channel. No other sysfs paths are written to by the application. Adding hwmon-pwm support does not increase the container's privilege level — the `privileged: true` flag already grants full sysfs access regardless of whether the application uses it.
+
+---
+
+## Known Limitations
+
+### Container crash behavior (hwmon-pwm)
+
+If the container is killed without a graceful shutdown (OOM kill, `docker kill -9`, kernel panic, power loss), hwmon-pwm fans remain at their last-written PWM duty cycle and control mode (`pwmN_enable = 1`). The BIOS/firmware fan curves do not resume until:
+
+- The system is rebooted (BIOS re-initializes all Super I/O registers), or
+- Another tool writes `pwmN_enable` back to the firmware value (e.g. `99` for nct6687, `2` for most other drivers)
+
+This does not apply to liquidctl fans — USB controllers like the Quadro have their own firmware that continues operating independently.
+
+**Mitigation:** Use `restart: unless-stopped` in `docker-compose.yml`. On container startup, Brisa takes over configured fans (saving the original enable value) and restores them on graceful shutdown. A restart after a crash will re-take-over the fans and resume normal operation.
+
+### Motherboard without Super I/O driver
+
+Many NAS-specific motherboards (e.g. Topton N22 with Intel N100/N305) use minimal embedded controllers for fan management instead of a traditional Super I/O chip. These boards may have BIOS-level fan control but no Linux kernel driver to expose sysfs PWM files. On such systems, hwmon-pwm detection will find zero controllable fans. This is a kernel/hardware limitation, not a Brisa limitation.
+
+### Non-writable PWM channels
+
+Some hwmon devices expose `fanN_input` (RPM reading) without a corresponding writable `pwmN` file. This can occur when the kernel driver supports monitoring but not control, or when the BIOS has locked the PWM registers. Brisa only lists fans where both `pwmN` and `pwmN_enable` exist and `pwmN` is writable.
+
+---
+
+## Open Questions / v3 Backlog
 
 - [ ] Hysteresis support in curves (fans only spin down below X, only spin up above Y)
 - [ ] Multi-device support (multiple liquidctl controllers simultaneously)
 - [ ] Auth on the web UI (basic auth option)
 - [ ] NVMe and other PCI sensor hwmon numbers are stable in practice but not guaranteed — WWID-style stable IDs for those sensors would be a future improvement
+- [ ] GPU fan control via amdgpu hwmon (detected but currently skipped — needs testing and safety review)
+- [ ] Expand hwmon-pwm deduplication blocklist as more liquidctl-backed devices are reported

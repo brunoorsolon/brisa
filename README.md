@@ -2,9 +2,11 @@
   <img src="brisa/app/static/logo_text.png" width="250">
 </p>
 
-Brisa is a self-contained Docker service for controlling USB fan controllers on TrueNAS SCALE (and any other Linux host where you can run Docker but can't install packages directly).
+*v0.3.0*
 
-Supports any device compatible with [liquidctl](https://github.com/liquidctl/liquidctl) and any temperature source exposed via `/sys/class/hwmon`.
+Brisa is a self-contained Docker service for controlling fans on TrueNAS SCALE (and any other Linux host where you can run Docker but can't install packages directly).
+
+Supports USB fan controllers via [liquidctl](https://github.com/liquidctl/liquidctl), motherboard PWM fan headers via sysfs, and any temperature source exposed via `/sys/class/hwmon`.
 
 ---
 
@@ -12,7 +14,9 @@ Supports any device compatible with [liquidctl](https://github.com/liquidctl/liq
 
 - **Docker-only** — no host installs required
 - **TrueNAS SCALE** primary target, works on any Linux host with Docker
-- **liquidctl-compatible** USB fan controllers (tested: Aquacomputer Quadro)
+- **Two fan control backends:**
+  - **liquidctl** — USB fan controllers (tested: Aquacomputer Quadro)
+  - **hwmon-pwm** — motherboard PWM fan headers via sysfs (tested: Nuvoton NCT6687)
 - **hwmon temperature sources** — CPU, NVMe, drives (drivetemp), network adapters, anything the kernel exposes
 - **Fan curves** — configurable temperature→speed curves per fan
 - **Manual override** — bypass curve control and hold a fixed speed per fan for testing
@@ -40,11 +44,15 @@ I'm sharing this in case it helps someone else with a similar setup. This note i
 
 ## Requirements
 
-- Docker with USB passthrough (`privileged: true`)
-- A USB fan controller supported by liquidctl (tested: Aquacomputer Quadro)
+- Docker with `privileged: true`
+- At least one of:
+  - A USB fan controller supported by liquidctl (tested: Aquacomputer Quadro)
+  - Motherboard PWM fan headers with a supported kernel driver (tested: Nuvoton NCT6687; also supports nct6775, it87, w83627ehf, and other Super I/O chips)
 - Temperature sensors accessible via `/sys/class/hwmon`
 
 Hardware access is required — there is no simulation mode.
+
+Either backend works independently — you don't need a USB controller to use hwmon-pwm fans, and vice versa.
 
 ---
 
@@ -118,8 +126,9 @@ Each sensor or fan can be assigned an accent color from a curated palette: teal,
 ## TrueNAS SCALE Notes
 
 - Deploy via `docker compose` only — do not use the TrueNAS Apps UI
-- `privileged: true` is required for USB access to the fan controller
+- `privileged: true` is required for USB access and sysfs PWM writes
 - Mount `/data` to a path on your NVMe pool — SQLite does not perform well on spinning rust
+- Many NAS-specific boards (e.g. Topton N22) lack a Super I/O chip with a Linux kernel driver — on these systems, hwmon-pwm fans will not be detected and only liquidctl (USB) fans are available
 
 Example `docker-compose.yml`:
 
@@ -137,6 +146,44 @@ services:
     volumes:
       - /docker/brisa:/data
 ```
+
+---
+
+## Podman
+
+Podman runs rootless by default, which means `--privileged` does not grant real host root. Sysfs writes for hwmon-pwm fans will fail silently in rootless mode.
+
+For hwmon-pwm fan control with Podman, run as real root with `/sys` mounted:
+
+```bash
+sudo podman build -t brisa:latest brisa/
+sudo podman run --privileged -v /sys:/sys -p 9595:9595 -v /path/to/data:/data brisa:latest
+```
+
+If only using liquidctl (USB) fans, rootless Podman with `--privileged` is sufficient.
+
+---
+
+## Security
+
+Brisa runs with `privileged: true`, which gives the container effectively root access to the host. This is required for USB device access and sysfs PWM writes — there is no way around it for hardware fan control from a container.
+
+What this means in practice: the container can access all host devices, write to any sysfs path, and mount filesystems. Brisa only writes to `/sys/class/hwmon/hwmonN/pwmN` and `pwmN_enable` files, but the capability is broader than what the application uses.
+
+**Recommendations:**
+- Do not expose port 9595 to the internet — Brisa has no authentication
+- Use `restart: unless-stopped` to ensure fans are re-managed after a crash
+- Review the container image contents if running on a sensitive system
+
+For homelab deployments on a trusted local network, the practical risk is low.
+
+---
+
+## Known Limitations
+
+**hwmon-pwm fans on container crash:** if the container is killed without a graceful shutdown (OOM, `kill -9`, power loss), hwmon-pwm fans stay at their last-written speed until the system is rebooted. On graceful shutdown (`docker stop`, `docker compose down`), Brisa restores the original firmware control mode automatically. liquidctl (USB) fans are not affected — USB controllers like the Quadro have their own firmware.
+
+**No Super I/O driver:** boards without a supported kernel driver for their fan controller chip (common on embedded NAS boards) will show zero hwmon-pwm fans. This is a kernel limitation. Check `ls /sys/class/hwmon/` and inspect the `name` files to see if a Super I/O driver is loaded (e.g. `nct6775`, `nct6687`, `it87`).
 
 ---
 

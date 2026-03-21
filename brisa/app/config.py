@@ -190,6 +190,10 @@ def validate_config(config: AppConfig, known_sensor_ids: list[str], known_fan_id
 
     # Validate fan configs — sensor_id can now be a virtual sensor
     for fan_cfg in config.fan_configs:
+        if fan_cfg.backend not in ("liquidctl", "hwmon-pwm"):
+            errors.append(
+                f"Fan '{fan_cfg.fan_id}' has invalid backend '{fan_cfg.backend}' (must be liquidctl or hwmon-pwm)"
+            )
         if fan_cfg.curve_name not in curve_names:
             errors.append(
                 f"Fan '{fan_cfg.fan_id}' references unknown curve '{fan_cfg.curve_name}'"

@@ -5,8 +5,9 @@ from fastapi.responses import PlainTextResponse
 
 from app.controller import _last_applied, resolve_virtual_sensors
 from app.database import query_history
-from app.hwmon import detect_sensors
+from app.sensors import detect_sensors
 from app.liquidctl_wrapper import get_fan_status
+from app import hwmon_pwm
 from app.models import AppConfig
 
 logger = logging.getLogger(__name__)
@@ -75,8 +76,15 @@ async def get_state():
         fan_status = get_fan_status()
         rpm_map = {f["id"]: f["current_rpm"] for f in fan_status}
     except Exception as e:
-        logger.warning("Could not fetch fan status: %s", e)
+        logger.warning("Could not fetch liquidctl fan status: %s", e)
         rpm_map = {}
+
+    # Add hwmon-pwm RPMs
+    for fc in config.fan_configs:
+        if fc.backend == "hwmon-pwm":
+            rpm = hwmon_pwm.get_fan_rpm(fc.fan_id)
+            if rpm is not None:
+                rpm_map[fc.fan_id] = rpm
 
     fan_cfg_map = {fc.fan_id: fc for fc in config.fan_configs}
 
@@ -159,13 +167,25 @@ async def post_config(new_config: AppConfig):
 
     try:
         sensors = detect_sensors()
-        fans = get_fan_status()
     except Exception as e:
-        logger.error("POST /config: device detection failed: %s", e)
-        raise HTTPException(status_code=503, detail=f"Could not detect devices for validation: {e}")
+        logger.error("POST /config: sensor detection failed: %s", e)
+        raise HTTPException(status_code=503, detail=f"Could not detect sensors for validation: {e}")
 
     known_sensor_ids = [s["id"] for s in sensors]
-    known_fan_ids = [f["id"] for f in fans]
+
+    known_fan_ids = []
+    try:
+        fans = get_fan_status()
+        known_fan_ids.extend(f["id"] for f in fans)
+    except Exception as e:
+        logger.warning("POST /config: liquidctl detection failed: %s", e)
+
+    # Include hwmon-pwm fans in known fan IDs
+    try:
+        pwm_fans = hwmon_pwm.detect_pwm_fans()
+        known_fan_ids.extend(f["id"] for f in pwm_fans)
+    except Exception as e:
+        logger.warning("POST /config: hwmon-pwm detection failed: %s", e)
 
     errors = validate_config(new_config, known_sensor_ids, known_fan_ids)
     if errors:
@@ -192,7 +212,27 @@ async def get_devices():
     real_sensor_map = {s["id"]: s["current_temp"] for s in sensors}
     virtual_sensor_dicts = _build_virtual_sensor_dicts(config, real_sensor_map)
 
-    fans = get_fan_status()
+    fans = []
+    try:
+        fans = get_fan_status()
+    except Exception as e:
+        logger.warning("Could not fetch liquidctl fans for /api/devices: %s", e)
+
+    # Detect hwmon-pwm fans and add them
+    pwm_fans = hwmon_pwm.detect_pwm_fans()
+    for pf in pwm_fans:
+        fans.append({
+            "id": pf["id"],
+            "label": pf["label"],
+            "current_rpm": pf["current_rpm"],
+            "backend": "hwmon-pwm",
+        })
+
+    # Tag liquidctl fans with their backend
+    for f in fans:
+        if "backend" not in f:
+            f["backend"] = "liquidctl"
+
     return {
         "sensors": sensors,
         "virtual_sensors": virtual_sensor_dicts,
@@ -216,7 +256,18 @@ async def metrics():
 
     real_sensor_map = {s["id"]: s["current_temp"] for s in sensors}
 
-    fans = get_fan_status()
+    fans = []
+    try:
+        fans.extend(get_fan_status())
+    except Exception:
+        pass
+
+    # Add hwmon-pwm fans with RPM readings
+    for fc in config.fan_configs:
+        if fc.backend == "hwmon-pwm":
+            rpm = hwmon_pwm.get_fan_rpm(fc.fan_id)
+            if rpm is not None:
+                fans.append({"id": fc.fan_id, "label": fc.fan_label, "current_rpm": rpm})
 
     lines = []
 

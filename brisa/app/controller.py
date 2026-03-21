@@ -3,13 +3,17 @@ import logging
 import time
 
 from app.database import write_reading, write_fan_reading, prune_old_rows
-from app.hwmon import detect_sensors
-from app.liquidctl_wrapper import set_fan_speed, get_fan_status
+from app.sensors import detect_sensors
+from app.liquidctl_wrapper import set_fan_speed as liquidctl_set_speed, get_fan_status
+from app import hwmon_pwm
 
 logger = logging.getLogger(__name__)
 
 # Last applied percent per fan_id — read by /api/state
 _last_applied: dict[str, int] = {}
+
+# Track which hwmon-pwm fans have been taken over in this session
+_pwm_taken_over: set[str] = set()
 
 
 def interpolate(points: list[dict], temp: float) -> int:
@@ -74,6 +78,57 @@ def resolve_virtual_sensors(
     return results
 
 
+def _ensure_pwm_takeover(fan_id: str) -> bool:
+    """
+    Ensure a hwmon-pwm fan has been taken over (manual mode enabled).
+    Only performs the takeover once per session per fan.
+    Returns True if the fan is ready for control.
+    """
+    if fan_id in _pwm_taken_over:
+        return True
+    if hwmon_pwm.takeover(fan_id):
+        _pwm_taken_over.add(fan_id)
+        return True
+    return False
+
+
+def _apply_fan_speed(fan_id: str, backend: str, percent: int) -> None:
+    """Route fan speed command to the correct backend."""
+    if backend == "hwmon-pwm":
+        if not _ensure_pwm_takeover(fan_id):
+            raise RuntimeError(f"Cannot take over hwmon-pwm fan '{fan_id}'")
+        hwmon_pwm.set_fan_speed(fan_id, percent)
+    else:
+        liquidctl_set_speed(fan_id, percent)
+
+
+def _get_rpm_map(config) -> dict[str, float]:
+    """
+    Collect RPM readings from all backends.
+    Returns a merged dict of fan_id -> current_rpm.
+    """
+    rpm_map: dict[str, float] = {}
+
+    # liquidctl RPMs (if any liquidctl fans are configured)
+    has_liquidctl = any(fc.backend == "liquidctl" for fc in config.fan_configs)
+    if has_liquidctl:
+        try:
+            fan_status = get_fan_status()
+            for f in fan_status:
+                rpm_map[f["id"]] = f["current_rpm"]
+        except RuntimeError as e:
+            logger.warning("Could not fetch liquidctl fan RPMs: %s", e)
+
+    # hwmon-pwm RPMs
+    for fc in config.fan_configs:
+        if fc.backend == "hwmon-pwm":
+            rpm = hwmon_pwm.get_fan_rpm(fc.fan_id)
+            if rpm is not None:
+                rpm_map[fc.fan_id] = rpm
+
+    return rpm_map
+
+
 async def run_once(config) -> None:
     ts = int(time.time())
     curve_map = {c.name: c for c in config.curves}
@@ -111,19 +166,14 @@ async def run_once(config) -> None:
                     percent = interpolate(points, temp)
 
         try:
-            set_fan_speed(fan_cfg.fan_id, percent)
+            _apply_fan_speed(fan_cfg.fan_id, fan_cfg.backend, percent)
             fan_results.append({"fan_id": fan_cfg.fan_id, "percent": percent})
             _last_applied[fan_cfg.fan_id] = percent
-            logger.debug("Set %s to %d%%", fan_cfg.fan_id, percent)
+            logger.debug("Set %s to %d%% via %s", fan_cfg.fan_id, percent, fan_cfg.backend)
         except RuntimeError as e:
             logger.error("Failed to set fan speed for '%s': %s", fan_cfg.fan_id, e)
 
-    rpm_map: dict[str, float] = {}
-    try:
-        fan_status = get_fan_status()
-        rpm_map = {f["id"]: f["current_rpm"] for f in fan_status}
-    except RuntimeError as e:
-        logger.warning("Could not fetch fan RPMs for DB write: %s", e)
+    rpm_map = _get_rpm_map(config)
 
     for sensor_id, temp in sensor_temps.items():
         write_reading(ts, sensor_id, temp)
@@ -144,7 +194,7 @@ async def loop() -> None:
     try:
         initialize()
     except RuntimeError as e:
-        logger.error("liquidctl initialize failed: %s — continuing anyway", e)
+        logger.error("%s — continuing anyway", e)
 
     config = get_config()
     if config.fan_configs:
@@ -153,7 +203,7 @@ async def loop() -> None:
             initial = fan_cfg.override_percent if fan_cfg.override_percent is not None \
                       else config.settings.safety_floor_percent
             try:
-                set_fan_speed(fan_cfg.fan_id, initial)
+                _apply_fan_speed(fan_cfg.fan_id, fan_cfg.backend, initial)
             except RuntimeError as e:
                 logger.error("Failed to apply initial speed to '%s': %s", fan_cfg.fan_id, e)
 

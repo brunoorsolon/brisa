@@ -23,6 +23,7 @@ class FanConfig(BaseModel):
     curve_name: str
     sensor_id: str
     override_percent: int | None = None
+    backend: str = "liquidctl"  # "liquidctl" or "hwmon-pwm"
 
 
 class VirtualSensor(BaseModel):
