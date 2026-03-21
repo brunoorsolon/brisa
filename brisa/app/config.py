@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 from pathlib import Path
 
 from app.models import AppConfig
@@ -9,6 +10,86 @@ logger = logging.getLogger(__name__)
 CONFIG_PATH = Path("/data/config.json")
 
 DEFAULT_CONFIG = AppConfig()
+
+# Regex to match old-style drivetemp IDs that contain a block device letter:
+#   drivetemp-wwid-<WWID>/sdX — <model>
+# Captures: (prefix including wwid), (block device letter part), (model)
+_OLD_DRIVETEMP_RE = re.compile(
+    r'^(drivetemp-wwid-[^/]+)/sd[a-z]+ \u2014 (.+)$'
+)
+
+
+def _migrate_sensor_id(old_id: str) -> str:
+    """
+    If old_id matches the old drivetemp format with /sdX, return the new
+    format with model only.  Otherwise return the original ID unchanged.
+    """
+    m = _OLD_DRIVETEMP_RE.match(old_id)
+    if m:
+        return f"{m.group(1)}/{m.group(2)}"
+    return old_id
+
+
+def migrate_drivetemp_ids(config: AppConfig) -> tuple[AppConfig, int]:
+    """
+    Rewrite any old-style drivetemp sensor IDs (containing /sdX) to the
+    new stable format (WWID + model only).
+
+    Returns (possibly-modified config, number of IDs migrated).
+    """
+    count = 0
+
+    # sensor_aliases: keys are sensor IDs
+    new_aliases: dict[str, str] = {}
+    for sid, alias in config.sensor_aliases.items():
+        new_sid = _migrate_sensor_id(sid)
+        if new_sid != sid:
+            count += 1
+            logger.info("Migrated alias key: %s -> %s", sid, new_sid)
+        new_aliases[new_sid] = alias
+    config.sensor_aliases = new_aliases
+
+    # virtual_sensors: source_sensor_ids
+    for vs in config.virtual_sensors:
+        new_sources = []
+        for sid in vs.source_sensor_ids:
+            new_sid = _migrate_sensor_id(sid)
+            if new_sid != sid:
+                count += 1
+                logger.info("Migrated virtual sensor '%s' source: %s -> %s", vs.id, sid, new_sid)
+            new_sources.append(new_sid)
+        vs.source_sensor_ids = new_sources
+
+    # fan_configs: sensor_id
+    for fc in config.fan_configs:
+        new_sid = _migrate_sensor_id(fc.sensor_id)
+        if new_sid != fc.sensor_id:
+            count += 1
+            logger.info("Migrated fan config '%s' sensor: %s -> %s", fc.fan_id, fc.sensor_id, new_sid)
+            fc.sensor_id = new_sid
+
+    # dashboard_groups: item_ids
+    for grp in config.dashboard_groups:
+        new_items = []
+        for sid in grp.item_ids:
+            new_sid = _migrate_sensor_id(sid)
+            if new_sid != sid:
+                count += 1
+                logger.info("Migrated group '%s' item: %s -> %s", grp.name, sid, new_sid)
+            new_items.append(new_sid)
+        grp.item_ids = new_items
+
+    # card_colors: keys are sensor/fan IDs
+    new_colors: dict[str, str] = {}
+    for sid, color in config.card_colors.items():
+        new_sid = _migrate_sensor_id(sid)
+        if new_sid != sid:
+            count += 1
+            logger.info("Migrated card color key: %s -> %s", sid, new_sid)
+        new_colors[new_sid] = color
+    config.card_colors = new_colors
+
+    return config, count
 
 
 def load_config() -> AppConfig:
@@ -27,11 +108,19 @@ def load_config() -> AppConfig:
         data = json.loads(raw)
         config = AppConfig.model_validate(data)
         logger.info("Loaded config from %s", CONFIG_PATH)
-        return config
     except json.JSONDecodeError as e:
         raise ValueError(f"Config file is not valid JSON: {e}") from e
     except Exception as e:
         raise ValueError(f"Config file failed validation: {e}") from e
+
+    # Migrate old drivetemp IDs if needed
+    config, migrated = migrate_drivetemp_ids(config)
+    if migrated > 0:
+        logger.warning("Migrated %d old-style drivetemp sensor ID(s) in config", migrated)
+        save_config(config)
+        logger.info("Config saved after drivetemp ID migration")
+
+    return config
 
 
 def save_config(config: AppConfig) -> None:

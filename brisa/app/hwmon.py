@@ -22,18 +22,22 @@ def _safe_wwid(wwid: str) -> str:
     return re.sub(r'\s+', '_', wwid.strip())
 
 
-def _build_drivetemp_map() -> dict[str, tuple[str, str]]:
+def _build_drivetemp_map() -> dict[str, tuple[str, str, str]]:
     """
     Build a mapping from resolved hwmon device path ->
-        (stable_key, human_label)
+        (stable_key, human_label, model)
 
     stable_key uses the drive WWID from /sys/class/block/<dev>/device/wwid,
     which is a globally unique identifier stable across reboots and drive
     reordering. Falls back to hwmon directory name if WWID is unavailable.
 
-    human_label is e.g. "sda — WDC WD120EFGX-68".
+    human_label includes the block device letter for display:
+        "sda — WDC WD120EFGX-68"
+
+    model is the drive model string without the block device letter,
+    used in the sensor ID for full reboot stability.
     """
-    mapping: dict[str, tuple[str, str]] = {}
+    mapping: dict[str, tuple[str, str, str]] = {}
 
     try:
         block_devs = os.listdir(BLOCK_PATH)
@@ -70,7 +74,7 @@ def _build_drivetemp_map() -> dict[str, tuple[str, str]]:
         for hwmon_entry in hwmon_entries:
             hwmon_real = os.path.realpath(os.path.join(hwmon_sub, hwmon_entry))
             stable_key = f"wwid-{wwid}" if wwid else hwmon_entry
-            mapping[hwmon_real] = (stable_key, label)
+            mapping[hwmon_real] = (stable_key, label, model or dev)
 
     return mapping
 
@@ -87,8 +91,10 @@ def detect_sensors() -> list[dict]:
             "current_temp": 38.0
         }
 
-    For drivetemp sensors the id uses the drive WWID for stability:
-        "drivetemp-wwid-naa.50014ee2c1c21634/sda — WDC WD120EFGX-68"
+    For drivetemp sensors the id uses WWID + model only (no block device letter):
+        "drivetemp-wwid-naa.50014ee2c1c21634/WDC WD120EFGX-68"
+    The label still includes the block device letter for display:
+        "sda — WDC WD120EFGX-68"
     Falls back to hwmon directory name if WWID is unavailable.
     """
     sensors = []
@@ -134,8 +140,9 @@ def detect_sensors() -> list[dict]:
                 continue
 
             if driver == "drivetemp" and device_path in drivetemp_map:
-                stable_key, label = drivetemp_map[device_path]
-                sensor_id = f"drivetemp-{stable_key}/{label}"
+                stable_key, label, model = drivetemp_map[device_path]
+                # ID uses WWID + model only — no block device letter
+                sensor_id = f"drivetemp-{stable_key}/{model}"
             else:
                 label_raw = _read_file(os.path.join(device_path, f"temp{n}_label"))
                 label = label_raw if label_raw else f"temp{n}"
@@ -162,4 +169,3 @@ def read_temp(sensor_id: str) -> float:
         if sensor["id"] == sensor_id:
             return sensor["current_temp"]
     raise ValueError(f"Sensor not found: {sensor_id!r}")
-

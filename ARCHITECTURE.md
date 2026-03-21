@@ -130,15 +130,15 @@ The controller loop runs as an asyncio background task inside the Uvicorn proces
   ],
   "sensor_aliases": {
     "nvme-hwmon1/Sensor 1": "NVMe Boot Drive",
-    "drivetemp-hwmon5/sda — WDC WD120XXXX": "NAS Drive 1"
+    "drivetemp-wwid-naa.5000000000000001/WDC WD120XXXX": "NAS Drive 1"
   },
   "virtual_sensors": [
     {
       "id": "virtual/all-drives-max",
       "name": "All Drives Max",
       "source_sensor_ids": [
-        "drivetemp-wwid-naa.5000000000000001/sda — WDC WD120XXXX",
-        "drivetemp-wwid-naa.5000000000000002/sdb — WDC WD120XXXX"
+        "drivetemp-wwid-naa.5000000000000001/WDC WD120XXXX",
+        "drivetemp-wwid-naa.5000000000000002/WDC WD120XXXX"
       ],
       "aggregation": "max"
     }
@@ -232,12 +232,15 @@ On startup (and via `GET /api/devices`), the service detects:
 - Read available `tempN_input` files
 - Read `tempN_label` if present (e.g. "Package id 0", "Core 0")
 - For `drivetemp` sensors: correlate the hwmon path back to the block device via `/sys/class/block`, read the model from `device/model` and the WWID from `device/wwid`, and produce:
-  - A stable sensor ID using the WWID: `drivetemp-wwid-<WWID>/<dev> — <model>`
-  - Example: `drivetemp-wwid-naa.5000000000000001/sda — WDC WD120XXXX`
+  - A stable sensor ID using the WWID and model only: `drivetemp-wwid-<WWID>/<model>`
+  - Example: `drivetemp-wwid-naa.5000000000000001/WDC WD120XXXX`
+  - The block device letter (`sda`, `sdb`, etc.) appears in the `label` field for display only — it is excluded from the ID because Linux can reassign device letters across reboots
   - Falls back to hwmon directory name if WWID is unavailable
 - Return structured list: `{ id, driver, label, current_temp, alias? }`
 
-**Why WWID for drivetemp IDs?** hwmon directory numbers (`hwmon5`, `hwmon6`...) are assigned by the kernel at boot based on driver load order and can shift if drives are added, removed, or reordered. The WWID (`/sys/class/block/<dev>/device/wwid`) is a globally unique hardware identifier that is stable across reboots and drive reordering — making it safe to use as the persistent sensor ID in `config.json`. Non-drivetemp sensors (coretemp, nvme, quadro, etc.) use hwmon-based IDs since their kernel assignment order is deterministic for PCI/onboard devices.
+**Why WWID for drivetemp IDs?** hwmon directory numbers (`hwmon5`, `hwmon6`...) are assigned by the kernel at boot based on driver load order and can shift if drives are added, removed, or reordered. The WWID (`/sys/class/block/<dev>/device/wwid`) is a globally unique hardware identifier that is stable across reboots and drive reordering — making it safe to use as the persistent sensor ID in `config.json`. The block device letter (`/dev/sdX`) is also unstable across reboots and is therefore excluded from the sensor ID. Non-drivetemp sensors (coretemp, nvme, quadro, etc.) use hwmon-based IDs since their kernel assignment order is deterministic for PCI/onboard devices.
+
+**Config migration:** On startup, `load_config()` runs `migrate_drivetemp_ids()` which detects old-style drivetemp IDs containing a block device letter (e.g. `drivetemp-wwid-<WWID>/sda — <model>`) and rewrites them to the new format (`drivetemp-wwid-<WWID>/<model>`) across all config sections: `sensor_aliases`, `virtual_sensors`, `fan_configs`, `dashboard_groups`, and `card_colors`. If any IDs were migrated, the config is saved back to disk automatically. Each migrated ID is logged individually at INFO level.
 
 **Fans** — query liquidctl:
 - Run `liquidctl list --json` to find connected devices
@@ -315,7 +318,7 @@ No hardcoded sensor or fan names anywhere in the codebase.
 - Card colors must be from the valid set: teal, blue, purple, pink, amber, orange, red, slate
 - Dashboard group types must be `sensor` or `fan`
 
-Hard reject on any violation. The validation cache is the live device scan at request time.
+Hard reject on any violation. The validation cache is the live device scan at request time. All validation errors are logged at WARNING level (with the full error list and known sensor/fan IDs) before the 422 response is returned.
 
 ### /api/metrics format (Prometheus)
 
@@ -444,7 +447,7 @@ brisa/
 │   └── app/
 │       ├── main.py              ← FastAPI app, lifespan, global config/loop state
 │       ├── models.py            ← Pydantic models (AppConfig, FanConfig, Curve, VirtualSensor, DashboardGroup, etc.)
-│       ├── config.py            ← load/save/validate config.json (incl. virtual sensor + group + color validation)
+│       ├── config.py            ← load/save/validate config.json, drivetemp ID migration (incl. virtual sensor + group + color validation)
 │       ├── controller.py        ← loop logic, interpolation, virtual sensor resolution, _last_applied cache
 │       ├── hwmon.py             ← /sys/class/hwmon reader + drivetemp enrichment
 │       ├── liquidctl_wrapper.py ← subprocess wrapper for liquidctl
