@@ -32,6 +32,18 @@ Supports USB fan controllers via [liquidctl](https://github.com/liquidctl/liquid
 
 ---
 
+## Screenshots
+
+| Dashboard | Sensors & Fans |
+|:-:|:-:|
+| ![Dashboard](https://imgur.com/gjAFiGj.png) | ![Sensors & Fans](https://imgur.com/R1qigY9.png) |
+
+| Curves | History |
+|:-:|:-:|
+| ![Curves](https://imgur.com/kHOx54W.png) | ![History](https://imgur.com/1YeoXkg.png) |
+
+---
+
 ## Disclaimer on AI Usage
 
 I built this project to solve a specific problem in my own TrueNAS SCALE homelab (controlling fans through Docker + liquidctl).
