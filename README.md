@@ -236,6 +236,13 @@ docker build -t brisa:latest brisa/
 docker compose up -d
 ```
 
+Optional: if you don't have a compose file, you can use the example provided, just remember to update the volume mappings to match your system.
+
+Run this before docker compose up -d:
+```bash
+mv docker-compose.yml.example docker-compose.yml
+```
+
 Logs:
 
 ```bash
