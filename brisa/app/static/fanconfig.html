@@ -296,7 +296,10 @@
         showToast('Override percent must be between 0 and 100', 'error'); return;
       }
 
-      const entry = { fan_id, fan_label, sensor_id, curve_name, override_percent };
+      curve_name, override_percent };
+      const backend = (devices.fans || []).find(f => f.id === fan_id)?.backend || 'liquidctl';
+      const entry = { fan_id, fan_label, sensor_id, curve_name, override_percent, backend };
+
       if (idx === -1) {
         config.fan_configs.push(entry);
       } else {

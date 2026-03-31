@@ -113,6 +113,17 @@ def load_config() -> AppConfig:
     except Exception as e:
         raise ValueError(f"Config file failed validation: {e}") from e
 
+    # Migrate hwmon-pwm backend field: fan IDs starting with "hwmon-pwm-"
+    # must use the "hwmon-pwm" backend, not the default "liquidctl".
+    backend_fixed = 0
+    for fc in config.fan_configs:
+        if fc.fan_id.startswith("hwmon-pwm-") and fc.backend != "hwmon-pwm":
+            logger.warning("Fixing backend for '%s': %s -> hwmon-pwm", fc.fan_id, fc.backend)
+            fc.backend = "hwmon-pwm"
+            backend_fixed += 1
+    if backend_fixed:
+        save_config(config)
+
     # Migrate old drivetemp IDs if needed
     config, migrated = migrate_drivetemp_ids(config)
     if migrated > 0:

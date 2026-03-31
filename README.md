@@ -2,7 +2,7 @@
   <img src="brisa/app/static/logo_text.png" width="250">
 </p>
 
-*v0.3.0*
+*v0.3.1*
 
 Brisa is a self-contained Docker service for controlling fans on TrueNAS SCALE (and any other Linux host where you can run Docker but can't install packages directly).
 
