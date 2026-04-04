@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Brisa — Dashboard</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <div id="sidebar" class="sidebar"></div>
+  <div class="main">
+    <div class="page">
+      <div class="page-header">
+        <div style="display:flex; align-items:center; justify-content:space-between;">
+          <div>
+            <h1 class="page-title"><span class="live-dot"></span>Dashboard</h1>
+            <p class="page-subtitle" id="last-updated">Fetching…</p>
+          </div>
+          <button class="btn btn-ghost" onclick="applyNow()" id="apply-btn">
+            ▶ Apply Now
+          </button>
+        </div>
+      </div>
+
+      <div id="dashboard-content">
+        <div style="color:var(--text-muted); padding:40px 0; text-align:center; font-size:13px">Loading…</div>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast"></div>
+  <script src="/app.js"></script>
+  <script>
+    let lastState = null;
+
+    async function loadState() {
+      try {
+        const data = await api('GET', '/state');
+        lastState = data;
+        renderDashboard(data);
+        document.getElementById('last-updated').textContent =
+          'Updated ' + new Date().toLocaleTimeString();
+      } catch (e) {
+        showToast('Failed to load state: ' + e.message, 'error');
+      }
+    }
+
+    function cardId(prefix, id) {
+      return prefix + btoa(unescape(encodeURIComponent(id))).replace(/[^a-zA-Z0-9]/g, '');
+    }
+
+    function renderDashboard(data) {
+      const container = document.getElementById('dashboard-content');
+      const hasFanGroups = data.fan_groups && data.fan_groups.length;
+      const hasSensorGroups = data.sensor_groups && data.sensor_groups.length;
+      const hasUngroupedFans = data.ungrouped_fans && data.ungrouped_fans.length;
+      const hasUngroupedSensors = data.ungrouped_sensors && data.ungrouped_sensors.length;
+      const hasAnything = hasFanGroups || hasSensorGroups || hasUngroupedFans || hasUngroupedSensors;
+
+      if (!hasAnything) {
+        container.innerHTML = `
+          <div class="empty-state">
+            <div style="font-size:32px;margin-bottom:8px">〜</div>
+            <p>No fans or sensors to display.</p>
+            <p style="margin-top:8px">Configure fans in <a href="/fanconfig.html" style="color:var(--accent)">Fan Config</a>
+            or set up dashboard groups in <a href="/devices.html" style="color:var(--accent)">Sensors & Fans</a>.</p>
+          </div>`;
+        return;
+      }
+
+      let html = '';
+
+      // Fan groups
+      if (hasFanGroups || hasUngroupedFans) {
+        html += `
+          <div class="dash-category">
+            <div class="dash-category-header">
+              <span class="dash-category-title">Fan Speeds</span>
+              <div class="dash-category-line"></div>
+            </div>`;
+
+        for (const grp of (data.fan_groups || [])) {
+          html += renderFanGroup(grp);
+        }
+
+        if (hasUngroupedFans) {
+          if (hasFanGroups) {
+            html += `
+              <div class="dash-group">
+                <div class="dash-group-header">
+                  <div class="dash-group-accent" style="background:var(--text-muted)"></div>
+                  <span class="dash-group-title" style="color:var(--text-dim)">Other</span>
+                </div>
+                <div class="grid-4">${data.ungrouped_fans.map(f => fanCardHTML(f)).join('')}</div>
+              </div>`;
+          } else {
+            html += `<div class="grid-4">${data.ungrouped_fans.map(f => fanCardHTML(f)).join('')}</div>`;
+          }
+        }
+
+        html += '</div>';
+      }
+
+      // Sensor groups
+      if (hasSensorGroups || hasUngroupedSensors) {
+        html += `
+          <div class="dash-category">
+            <div class="dash-category-header">
+              <span class="dash-category-title">Temperatures</span>
+              <div class="dash-category-line"></div>
+            </div>`;
+
+        for (const grp of (data.sensor_groups || [])) {
+          html += renderSensorGroup(grp);
+        }
+
+        if (hasUngroupedSensors) {
+          if (hasSensorGroups) {
+            html += `
+              <div class="dash-group">
+                <div class="dash-group-header">
+                  <div class="dash-group-accent" style="background:var(--text-muted)"></div>
+                  <span class="dash-group-title" style="color:var(--text-dim)">Other</span>
+                </div>
+                <div class="grid-4">${data.ungrouped_sensors.map(s => sensorCardHTML(s)).join('')}</div>
+              </div>`;
+          } else {
+            html += `<div class="grid-4">${data.ungrouped_sensors.map(s => sensorCardHTML(s)).join('')}</div>`;
+          }
+        }
+
+        html += '</div>';
+      }
+
+      container.innerHTML = html;
+      updateValues(data);
+    }
+
+    function renderFanGroup(grp) {
+      if (!grp.items.length) return '';
+      return `
+        <div class="dash-group">
+          <div class="dash-group-header">
+            <div class="dash-group-accent"></div>
+            <span class="dash-group-title">${grp.name}</span>
+          </div>
+          <div class="grid-4">${grp.items.map(f => fanCardHTML(f)).join('')}</div>
+        </div>`;
+    }
+
+    function renderSensorGroup(grp) {
+      if (!grp.items.length) return '';
+      return `
+        <div class="dash-group">
+          <div class="dash-group-header">
+            <div class="dash-group-accent"></div>
+            <span class="dash-group-title">${grp.name}</span>
+          </div>
+          <div class="grid-4">${grp.items.map(s => sensorCardHTML(s)).join('')}</div>
+        </div>`;
+    }
+
+    function fanCardHTML(fan) {
+      const cid = cardId('fan-card-', fan.id);
+      const colorAttr = fan.color ? ` data-color="${fan.color}"` : '';
+      return `
+        <div class="stat-card" id="${cid}"${colorAttr}>
+          <div class="stat-label">
+            ${fan.label || fan.id}
+            ${fan.override_percent != null ? '<span class="badge badge-warn" style="margin-left:6px;font-size:10px">MANUAL</span>' : ''}
+          </div>
+          <div style="display:flex; align-items:baseline; justify-content:space-between;">
+            <div>
+              <span class="stat-value" id="val-${cid}">—</span>
+              <span class="stat-unit">rpm</span>
+            </div>
+            <span class="mono" style="font-size:12px; color:var(--text-muted);" id="pct-${cid}"></span>
+          </div>
+        </div>`;
+    }
+
+    function sensorCardHTML(s) {
+      const cid = cardId('temp-card-', s.sensor_id);
+      const label = s.alias || s.sensor_id.split('/').pop();
+      const isVirtual = s.virtual === true;
+      const colorAttr = s.color ? ` data-color="${s.color}"` : '';
+      return `
+        <div class="stat-card" id="${cid}"${colorAttr}>
+          <div class="stat-label" title="${s.sensor_id}">
+            ${label}
+            ${isVirtual ? '<span class="badge badge-dim" style="margin-left:6px;font-size:10px">VIRTUAL</span>' : ''}
+          </div>
+          <div>
+            <span class="stat-value" id="val-${cid}">—</span>
+            <span class="stat-unit">°C</span>
+          </div>
+        </div>`;
+    }
+
+    function updateValues(data) {
+      // Update fan values
+      const allFans = [
+        ...(data.fan_groups || []).flatMap(g => g.items),
+        ...(data.ungrouped_fans || []),
+      ];
+      allFans.forEach(fan => {
+        const cid = cardId('fan-card-', fan.id);
+        const valEl = document.getElementById('val-' + cid);
+        flashValue(valEl, fmtRpm(fan.current_rpm));
+        const pctEl = document.getElementById('pct-' + cid);
+        if (pctEl) pctEl.textContent = fan.last_percent != null ? '(' + fan.last_percent + '%)' : '';
+      });
+
+      // Update sensor values
+      const allSensors = [
+        ...(data.sensor_groups || []).flatMap(g => g.items),
+        ...(data.ungrouped_sensors || []),
+      ];
+      allSensors.forEach(s => {
+        const cid = cardId('temp-card-', s.sensor_id);
+        const valEl = document.getElementById('val-' + cid);
+        flashValue(valEl, fmtTemp(s.temp));
+      });
+    }
+
+    async function applyNow() {
+      const btn = document.getElementById('apply-btn');
+      btn.disabled = true;
+      btn.textContent = 'Applying…';
+      try {
+        await api('POST', '/apply');
+        showToast('Applied — fans updated', 'ok');
+        await loadState();
+      } catch (e) {
+        showToast('Apply failed: ' + e.message, 'error');
+      } finally {
+        btn.disabled = false;
+        btn.textContent = '▶ Apply Now';
+      }
+    }
+
+    loadState();
+    setInterval(loadState, 10000);
+  </script>
+</body>
+</html>

@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Brisa — History</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+  <style>
+    .range-btns { display: flex; gap: 6px; }
+    .range-btn {
+      background: none; border: 1px solid var(--border);
+      color: var(--text-dim); border-radius: var(--radius);
+      padding: 5px 12px; font-size: 12px;
+      transition: border-color var(--transition), color var(--transition);
+    }
+    .range-btn:hover { border-color: var(--accent); color: var(--text); }
+    .range-btn.active { border-color: var(--accent); color: var(--accent); }
+    .chart-wrap { position: relative; height: 240px; }
+  </style>
+</head>
+<body>
+  <div id="sidebar" class="sidebar"></div>
+  <div class="main">
+    <div class="page">
+      <div class="page-header">
+        <div style="display:flex; align-items:center; justify-content:space-between;">
+          <div>
+            <h1 class="page-title">History</h1>
+            <p class="page-subtitle">Temperature and fan speed over time</p>
+          </div>
+          <div class="range-btns">
+            <button class="range-btn" onclick="setRange(1)">1h</button>
+            <button class="range-btn" onclick="setRange(6)">6h</button>
+            <button class="range-btn active" onclick="setRange(24)">24h</button>
+            <button class="range-btn" onclick="setRange(168)">7d</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="section">
+        <div class="section-header"><span class="section-title">Temperatures</span></div>
+        <div class="card">
+          <div class="chart-wrap"><canvas id="temp-chart"></canvas></div>
+        </div>
+      </div>
+
+      <div class="section">
+        <div class="section-header"><span class="section-title">Fan Speed (%)</span></div>
+        <div class="card">
+          <div class="chart-wrap"><canvas id="fan-chart"></canvas></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast"></div>
+  <script src="/app.js"></script>
+  <script>
+    let currentHours = 24;
+    let tempChart = null, fanChart = null;
+
+    const COLORS = ['#00d4aa','#60a5fa','#f59e0b','#f472b6','#a78bfa','#34d399','#fb923c','#e879f9'];
+
+    function setRange(hours) {
+      currentHours = hours;
+      document.querySelectorAll('.range-btn').forEach(btn => {
+        btn.classList.toggle('active', btn.textContent === rangeLabel(hours));
+      });
+      loadHistory();
+    }
+
+    function rangeLabel(h) {
+      if (h === 1) return '1h';
+      if (h === 6) return '6h';
+      if (h === 24) return '24h';
+      if (h === 168) return '7d';
+      return h + 'h';
+    }
+
+    function formatTs(ts) {
+      const d = new Date(ts * 1000);
+      return currentHours <= 6
+        ? d.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})
+        : currentHours <= 24
+          ? d.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})
+          : d.toLocaleDateString([], {month:'short', day:'numeric', hour:'2-digit', minute:'2-digit'});
+    }
+
+    async function loadHistory() {
+      try {
+        const data = await api('GET', `/history?hours=${currentHours}`);
+        renderTempChart(data.sensors || []);
+        renderFanChart(data.fans || []);
+      } catch (e) {
+        showToast('Failed to load history: ' + e.message, 'error');
+      }
+    }
+
+    function chartDefaults() {
+      const isDark = document.documentElement.getAttribute('data-theme') !== 'light';
+      return {
+        gridColor: isDark ? '#272b30' : '#dddbd6',
+        textColor: isDark ? '#7a7f88' : '#6b7280',
+      };
+    }
+
+    function renderTempChart(rows) {
+      const ctx = document.getElementById('temp-chart');
+      if (tempChart) { tempChart.destroy(); tempChart = null; }
+
+      if (!rows.length) {
+        ctx.getContext('2d').clearRect(0, 0, ctx.width, ctx.height);
+        return;
+      }
+
+      // Group by sensor_id
+      const groups = {};
+      rows.forEach(r => {
+        if (!groups[r.sensor_id]) groups[r.sensor_id] = [];
+        groups[r.sensor_id].push(r);
+      });
+
+      const allTs = [...new Set(rows.map(r => r.ts))].sort();
+      const { gridColor, textColor } = chartDefaults();
+
+      tempChart = new Chart(ctx, {
+        type: 'line',
+        data: {
+          labels: allTs.map(formatTs),
+          datasets: Object.entries(groups).map(([sid, pts], i) => ({
+            label: sid.split('/').pop(),
+            data: allTs.map(ts => { const p = pts.find(r => r.ts === ts); return p ? p.temp : null; }),
+            borderColor: COLORS[i % COLORS.length],
+            backgroundColor: 'transparent',
+            tension: 0.3,
+            pointRadius: 0,
+            borderWidth: 1.5,
+            spanGaps: true,
+          }))
+        },
+        options: {
+          responsive: true, maintainAspectRatio: false,
+          plugins: { legend: { labels: { color: textColor, font: { family: 'IBM Plex Sans', size: 11 }, boxWidth: 12 } } },
+          scales: {
+            x: { grid: { color: gridColor }, ticks: { color: textColor, font: { family: 'JetBrains Mono', size: 10 }, maxTicksLimit: 8 } },
+            y: { grid: { color: gridColor }, ticks: { color: textColor, font: { family: 'JetBrains Mono', size: 10 }, callback: v => v + '°' } }
+          }
+        }
+      });
+    }
+
+    function renderFanChart(rows) {
+      const ctx = document.getElementById('fan-chart');
+      if (fanChart) { fanChart.destroy(); fanChart = null; }
+
+      if (!rows.length) {
+        ctx.getContext('2d').clearRect(0, 0, ctx.width, ctx.height);
+        return;
+      }
+
+      const groups = {};
+      rows.forEach(r => {
+        if (!groups[r.fan_id]) groups[r.fan_id] = [];
+        groups[r.fan_id].push(r);
+      });
+
+      const allTs = [...new Set(rows.map(r => r.ts))].sort();
+      const { gridColor, textColor } = chartDefaults();
+
+      fanChart = new Chart(ctx, {
+        type: 'line',
+        data: {
+          labels: allTs.map(formatTs),
+          datasets: Object.entries(groups).map(([fid, pts], i) => ({
+            label: fid,
+            data: allTs.map(ts => { const p = pts.find(r => r.ts === ts); return p ? p.percent : null; }),
+            borderColor: COLORS[i % COLORS.length],
+            backgroundColor: 'transparent',
+            tension: 0.3,
+            pointRadius: 0,
+            borderWidth: 1.5,
+            spanGaps: true,
+          }))
+        },
+        options: {
+          responsive: true, maintainAspectRatio: false,
+          plugins: { legend: { labels: { color: textColor, font: { family: 'IBM Plex Sans', size: 11 }, boxWidth: 12 } } },
+          scales: {
+            x: { grid: { color: gridColor }, ticks: { color: textColor, font: { family: 'JetBrains Mono', size: 10 }, maxTicksLimit: 8 } },
+            y: {
+              min: 0, max: 100,
+              grid: { color: gridColor },
+              ticks: { color: textColor, font: { family: 'JetBrains Mono', size: 10 }, callback: v => v + '%' }
+            }
+          }
+        }
+      });
+    }
+
+    loadHistory();
+  </script>
+</body>
+</html>

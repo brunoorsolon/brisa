@@ -1,0 +1,442 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Brisa — Curves</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+  <style>
+    .curve-card { margin-bottom: 20px; }
+    .curve-header {
+      display: flex; align-items: center; justify-content: space-between;
+      margin-bottom: 16px;
+    }
+    .curve-name-input {
+      font-family: var(--font-mono);
+      font-size: 15px; font-weight: 600;
+      color: var(--text);
+      background: none;
+      border: none;
+      border-bottom: 1px solid transparent;
+      outline: none;
+      padding: 2px 4px;
+      width: 200px;
+      transition: border-color var(--transition);
+    }
+    .curve-name-input:hover { border-bottom-color: var(--border); }
+    .curve-name-input:focus { border-bottom-color: var(--accent); }
+
+    .curve-body { display: grid; grid-template-columns: 1fr 320px; gap: 20px; align-items: start; }
+    .points-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    .points-table th {
+      text-align: left; font-size: 10px; font-weight: 600;
+      letter-spacing: 0.08em; text-transform: uppercase;
+      color: var(--text-muted); padding: 0 8px 8px;
+    }
+    .points-table td { padding: 6px 8px; }
+    .points-table input {
+      width: 80px; background: var(--bg); border: 1px solid var(--border);
+      border-radius: 4px; color: var(--text); padding: 5px 8px;
+      font-family: var(--font-mono); font-size: 12px; outline: none;
+    }
+    .points-table input:focus { border-color: var(--accent); }
+    canvas { border-radius: var(--radius); }
+
+    .unsaved-badge {
+      display: none;
+      font-size: 11px; color: var(--warn);
+      font-family: var(--font-mono);
+      margin-left: 10px;
+    }
+    .unsaved-badge.visible { display: inline; }
+
+    /* Modal */
+    .modal-overlay {
+      position: fixed; inset: 0;
+      background: rgba(0,0,0,0.6); backdrop-filter: blur(2px);
+      z-index: 200; display: flex; align-items: center; justify-content: center;
+      opacity: 0; pointer-events: none; transition: opacity 0.2s;
+    }
+    .modal-overlay.open { opacity: 1; pointer-events: all; }
+    .modal {
+      background: var(--bg-card); border: 1px solid var(--border);
+      border-radius: var(--radius-lg); padding: 28px; width: 360px;
+      transform: translateY(12px); transition: transform 0.2s;
+    }
+    .modal-overlay.open .modal { transform: translateY(0); }
+    .modal-title { font-size: 15px; font-weight: 600; margin-bottom: 20px; }
+    .modal-actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 24px; }
+  </style>
+</head>
+<body>
+  <div id="sidebar" class="sidebar"></div>
+  <div class="main">
+    <div class="page">
+      <div class="page-header">
+        <div style="display:flex; align-items:center; justify-content:space-between;">
+          <div style="display:flex; align-items:center;">
+            <h1 class="page-title">Curves</h1>
+            <span class="unsaved-badge" id="unsaved-badge">● unsaved changes</span>
+          </div>
+          <div style="display:flex; gap:8px;">
+            <button class="btn btn-ghost" id="discard-btn" onclick="discardChanges()" style="display:none">Discard</button>
+            <button class="btn btn-primary" id="save-btn" onclick="saveConfig()" style="display:none">Save</button>
+            <button class="btn btn-ghost" onclick="openNewCurveModal()">+ New Curve</button>
+          </div>
+        </div>
+        <p class="page-subtitle">Define temperature → fan speed relationships</p>
+      </div>
+
+      <div id="curves-container">
+        <div style="color:var(--text-muted); padding:40px 0; text-align:center; font-size:13px">Loading…</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- New curve modal -->
+  <div class="modal-overlay" id="new-curve-modal">
+    <div class="modal">
+      <div class="modal-title">New Curve</div>
+      <div class="form-group">
+        <label class="form-label">Curve name</label>
+        <input class="form-input" id="new-curve-name" placeholder="e.g. silent, aggressive" />
+      </div>
+      <div class="modal-actions">
+        <button class="btn btn-ghost" onclick="closeNewCurveModal()">Cancel</button>
+        <button class="btn btn-primary" onclick="createCurve()">Create</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Delete confirmation modal -->
+  <div class="modal-overlay" id="delete-modal">
+    <div class="modal">
+      <div class="modal-title">Delete Curve</div>
+      <p id="delete-modal-body" style="font-size:13px; color:var(--text-dim); line-height:1.6"></p>
+      <div class="modal-actions">
+        <button class="btn btn-ghost" onclick="closeDeleteModal()">Cancel</button>
+        <button class="btn btn-danger-ghost" id="delete-confirm-btn" onclick="confirmDelete()" style="border-color:var(--danger);color:var(--danger)">Delete</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast"></div>
+  <script src="/app.js"></script>
+  <script>
+    let savedConfig = null;
+    let workingConfig = null;
+    let isDirty = false;
+    let pendingDeleteIndex = null;
+    const charts = {};
+
+    async function loadConfig() {
+      try {
+        savedConfig = await api('GET', '/config');
+        workingConfig = JSON.parse(JSON.stringify(savedConfig));
+        isDirty = false;
+        updateDirtyState();
+        render();
+      } catch (e) {
+        showToast('Failed to load config: ' + e.message, 'error');
+      }
+    }
+
+    function markDirty() {
+      isDirty = true;
+      updateDirtyState();
+    }
+
+    function updateDirtyState() {
+      document.getElementById('unsaved-badge').classList.toggle('visible', isDirty);
+      document.getElementById('save-btn').style.display = isDirty ? '' : 'none';
+      document.getElementById('discard-btn').style.display = isDirty ? '' : 'none';
+    }
+
+    function discardChanges() {
+      workingConfig = JSON.parse(JSON.stringify(savedConfig));
+      isDirty = false;
+      updateDirtyState();
+      render();
+      showToast('Changes discarded', 'ok');
+    }
+
+    function render() {
+      const container = document.getElementById('curves-container');
+      if (!workingConfig.curves.length) {
+        container.innerHTML = `
+          <div class="empty-state">
+            <div style="font-size:32px;margin-bottom:8px">〜</div>
+            <p>No curves defined yet. Create one to get started.</p>
+          </div>`;
+        return;
+      }
+
+      Object.values(charts).forEach(c => c.destroy());
+      Object.keys(charts).forEach(k => delete charts[k]);
+
+      container.innerHTML = '';
+      workingConfig.curves.forEach((curve, ci) => {
+        const div = document.createElement('div');
+        div.className = 'card curve-card';
+        div.id = 'curve-card-' + ci;
+        div.innerHTML = buildCurveHTML(curve, ci);
+        container.appendChild(div);
+        renderChart(curve, ci);
+      });
+    }
+
+    function buildCurveHTML(curve, ci) {
+      const rows = curve.points.map((p, pi) => `
+        <tr>
+          <td><input type="number" value="${p.temp}" min="0" max="120"
+            onblur="updatePoint(${ci}, ${pi}, 'temp', this.value)" /></td>
+          <td><input type="number" value="${p.percent}" min="0" max="100"
+            onblur="updatePoint(${ci}, ${pi}, 'percent', this.value)" /></td>
+          <td>
+            <button class="btn btn-danger-ghost" style="padding:4px 8px;font-size:11px"
+              onclick="removePoint(${ci}, ${pi})">✕</button>
+          </td>
+        </tr>
+      `).join('');
+
+      return `
+        <div class="curve-header">
+          <input
+            class="curve-name-input"
+            value="${curve.name}"
+            onblur="renameCurve(${ci}, this.value)"
+            title="Click to rename"
+          />
+          <div style="display:flex;gap:8px">
+            <button class="btn btn-ghost" onclick="addPoint(${ci})">+ Point</button>
+            <button class="btn btn-danger-ghost" onclick="openDeleteModal(${ci})">Delete</button>
+          </div>
+        </div>
+        <div class="curve-body">
+          <div>
+            <table class="points-table">
+              <thead><tr><th>Temp (°C)</th><th>Fan (%)</th><th></th></tr></thead>
+              <tbody id="points-${ci}">${rows}</tbody>
+            </table>
+          </div>
+          <div>
+            <canvas id="chart-${ci}" height="180"></canvas>
+          </div>
+        </div>
+      `;
+    }
+
+    function renderChart(curve, ci) {
+      const ctx = document.getElementById('chart-' + ci);
+      if (!ctx) return;
+      const pts = [...curve.points].sort((a, b) => a.temp - b.temp);
+      const isDark = document.documentElement.getAttribute('data-theme') !== 'light';
+      const accent = isDark ? '#00d4aa' : '#007a62';
+      const gridColor = isDark ? '#272b30' : '#dddbd6';
+      const textColor = isDark ? '#7a7f88' : '#6b7280';
+
+      if (charts[ci]) charts[ci].destroy();
+      charts[ci] = new Chart(ctx, {
+        type: 'line',
+        data: {
+          labels: pts.map(p => p.temp + '°'),
+          datasets: [{
+            data: pts.map(p => p.percent),
+            borderColor: accent,
+            backgroundColor: accent + '18',
+            fill: true,
+            tension: 0,
+            pointRadius: 4,
+            pointBackgroundColor: accent,
+          }]
+        },
+        options: {
+          responsive: true,
+          plugins: { legend: { display: false } },
+          scales: {
+            x: { grid: { color: gridColor }, ticks: { color: textColor, font: { family: 'JetBrains Mono', size: 11 } } },
+            y: {
+              min: 0, max: 100,
+              grid: { color: gridColor },
+              ticks: { color: textColor, font: { family: 'JetBrains Mono', size: 11 }, callback: v => v + '%' }
+            }
+          }
+        }
+      });
+    }
+
+    function updatePoint(ci, pi, field, value) {
+      const parsed = field === 'percent' ? parseInt(value) : parseFloat(value);
+      if (isNaN(parsed)) return;
+      workingConfig.curves[ci].points[pi][field] = parsed;
+      // Only redraw this curve's chart, don't re-render the whole page
+      renderChart(workingConfig.curves[ci], ci);
+      markDirty();
+    }
+
+    function renameCurve(ci, newName) {
+      newName = newName.trim();
+      if (!newName) {
+        // Revert the input visually
+        document.querySelector(`#curve-card-${ci} .curve-name-input`).value = workingConfig.curves[ci].name;
+        showToast('Curve name cannot be empty', 'error');
+        return;
+      }
+      const duplicate = workingConfig.curves.find((c, i) => i !== ci && c.name === newName);
+      if (duplicate) {
+        document.querySelector(`#curve-card-${ci} .curve-name-input`).value = workingConfig.curves[ci].name;
+        showToast(`A curve named "${newName}" already exists`, 'error');
+        return;
+      }
+      const oldName = workingConfig.curves[ci].name;
+      if (oldName === newName) return;
+
+      // Update fan_configs that reference the old name
+      workingConfig.fan_configs.forEach(fc => {
+        if (fc.curve_name === oldName) fc.curve_name = newName;
+      });
+      workingConfig.curves[ci].name = newName;
+      markDirty();
+    }
+
+    function addPoint(ci) {
+      // Capture scroll position before any DOM changes
+      const scrollY = window.scrollY;
+
+      const pts = workingConfig.curves[ci].points;
+      const lastTemp = pts.length ? pts[pts.length - 1].temp + 10 : 30;
+      const lastPct  = pts.length ? Math.min(pts[pts.length - 1].percent + 10, 100) : 50;
+      pts.push({ temp: lastTemp, percent: lastPct });
+      markDirty();
+
+      // Rebuild just this curve card's points table, not the full page
+      const tbody = document.getElementById('points-' + ci);
+      if (tbody) {
+        tbody.innerHTML = workingConfig.curves[ci].points.map((p, pi) => `
+          <tr>
+            <td><input type="number" value="${p.temp}" min="0" max="120"
+              onblur="updatePoint(${ci}, ${pi}, 'temp', this.value)" /></td>
+            <td><input type="number" value="${p.percent}" min="0" max="100"
+              onblur="updatePoint(${ci}, ${pi}, 'percent', this.value)" /></td>
+            <td>
+              <button class="btn btn-danger-ghost" style="padding:4px 8px;font-size:11px"
+                onclick="removePoint(${ci}, ${pi})">✕</button>
+            </td>
+          </tr>
+        `).join('');
+        renderChart(workingConfig.curves[ci], ci);
+        // Restore scroll position
+        window.scrollTo(0, scrollY);
+      } else {
+        render();
+        window.scrollTo(0, scrollY);
+      }
+    }
+
+    function removePoint(ci, pi) {
+      const scrollY = window.scrollY;
+      workingConfig.curves[ci].points.splice(pi, 1);
+      markDirty();
+
+      const tbody = document.getElementById('points-' + ci);
+      if (tbody) {
+        tbody.innerHTML = workingConfig.curves[ci].points.map((p, pi2) => `
+          <tr>
+            <td><input type="number" value="${p.temp}" min="0" max="120"
+              onblur="updatePoint(${ci}, ${pi2}, 'temp', this.value)" /></td>
+            <td><input type="number" value="${p.percent}" min="0" max="100"
+              onblur="updatePoint(${ci}, ${pi2}, 'percent', this.value)" /></td>
+            <td>
+              <button class="btn btn-danger-ghost" style="padding:4px 8px;font-size:11px"
+                onclick="removePoint(${ci}, ${pi2})">✕</button>
+            </td>
+          </tr>
+        `).join('');
+        renderChart(workingConfig.curves[ci], ci);
+        window.scrollTo(0, scrollY);
+      } else {
+        render();
+        window.scrollTo(0, scrollY);
+      }
+    }
+
+    function openDeleteModal(ci) {
+      const curveName = workingConfig.curves[ci].name;
+      const usedBy = workingConfig.fan_configs
+        .filter(fc => fc.curve_name === curveName)
+        .map(fc => fc.fan_label || fc.fan_id);
+
+      pendingDeleteIndex = ci;
+
+      const body = document.getElementById('delete-modal-body');
+      if (usedBy.length) {
+        body.innerHTML = `Cannot delete <strong>${curveName}</strong> — it is assigned to: <strong>${usedBy.join(', ')}</strong>.<br><br>Remove those fan assignments first.`;
+        document.getElementById('delete-confirm-btn').style.display = 'none';
+      } else {
+        body.innerHTML = `Are you sure you want to delete curve <strong>${curveName}</strong>? This cannot be undone.`;
+        document.getElementById('delete-confirm-btn').style.display = '';
+      }
+
+      document.getElementById('delete-modal').classList.add('open');
+    }
+
+    function closeDeleteModal() {
+      document.getElementById('delete-modal').classList.remove('open');
+      pendingDeleteIndex = null;
+    }
+
+    function confirmDelete() {
+      if (pendingDeleteIndex === null) return;
+      workingConfig.curves.splice(pendingDeleteIndex, 1);
+      markDirty();
+      closeDeleteModal();
+      render();
+    }
+
+    function openNewCurveModal() {
+      document.getElementById('new-curve-modal').classList.add('open');
+      document.getElementById('new-curve-name').focus();
+    }
+
+    function closeNewCurveModal() {
+      document.getElementById('new-curve-modal').classList.remove('open');
+      document.getElementById('new-curve-name').value = '';
+    }
+
+    function createCurve() {
+      const name = document.getElementById('new-curve-name').value.trim();
+      if (!name) { showToast('Name is required', 'error'); return; }
+      if (workingConfig.curves.find(c => c.name === name)) {
+        showToast('A curve with that name already exists', 'error'); return;
+      }
+      workingConfig.curves.push({ name, points: [
+        { temp: 30, percent: 30 },
+        { temp: 50, percent: 60 },
+        { temp: 70, percent: 100 },
+      ]});
+      closeNewCurveModal();
+      markDirty();
+      render();
+    }
+
+    async function saveConfig() {
+      try {
+        await api('POST', '/config', workingConfig);
+        savedConfig = JSON.parse(JSON.stringify(workingConfig));
+        isDirty = false;
+        updateDirtyState();
+        showToast('Saved', 'ok');
+      } catch (e) {
+        showToast('Save failed: ' + e.message, 'error');
+      }
+    }
+
+    window.addEventListener('beforeunload', e => {
+      if (isDirty) { e.preventDefault(); e.returnValue = ''; }
+    });
+
+    loadConfig();
+  </script>
+</body>
+</html>

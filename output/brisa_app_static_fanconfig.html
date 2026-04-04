@@ -1,0 +1,337 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Brisa — Fan Config</title>
+  <link rel="stylesheet" href="/style.css">
+  <style>
+    .modal-overlay {
+      position: fixed; inset: 0;
+      background: rgba(0,0,0,0.6); backdrop-filter: blur(2px);
+      z-index: 200; display: flex; align-items: center; justify-content: center;
+      opacity: 0; pointer-events: none; transition: opacity 0.2s;
+    }
+    .modal-overlay.open { opacity: 1; pointer-events: all; }
+    .modal {
+      background: var(--bg-card); border: 1px solid var(--border);
+      border-radius: var(--radius-lg); padding: 28px; width: 440px;
+      transform: translateY(12px); transition: transform 0.2s;
+    }
+    .modal-overlay.open .modal { transform: translateY(0); }
+    .modal-title { font-size: 15px; font-weight: 600; margin-bottom: 20px; }
+    .modal-actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 24px; }
+
+    /* Toggle switch */
+    .toggle-row {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 12px 0;
+      border-top: 1px solid var(--border-dim);
+      margin-top: 6px;
+    }
+    .toggle-label { font-size: 13px; font-weight: 500; color: var(--text); }
+    .toggle-sub { font-size: 11px; color: var(--text-muted); margin-top: 2px; }
+    .toggle {
+      position: relative; width: 36px; height: 20px; flex-shrink: 0;
+    }
+    .toggle input { opacity: 0; width: 0; height: 0; }
+    .toggle-slider {
+      position: absolute; inset: 0;
+      background: var(--border); border-radius: 20px;
+      cursor: pointer; transition: background 0.2s;
+    }
+    .toggle-slider::before {
+      content: ''; position: absolute;
+      width: 14px; height: 14px; border-radius: 50%;
+      background: white; left: 3px; top: 3px;
+      transition: transform 0.2s;
+    }
+    .toggle input:checked + .toggle-slider { background: var(--accent); }
+    .toggle input:checked + .toggle-slider::before { transform: translateX(16px); }
+
+    .override-input-row {
+      display: none; align-items: center; gap: 10px;
+      margin-top: 10px;
+    }
+    .override-input-row.visible { display: flex; }
+    .override-input-row input {
+      width: 80px;
+    }
+    .override-input-row .unit {
+      font-size: 12px; color: var(--text-muted); font-family: var(--font-mono);
+    }
+  </style>
+</head>
+<body>
+  <div id="sidebar" class="sidebar"></div>
+  <div class="main">
+    <div class="page">
+      <div class="page-header">
+        <div style="display:flex; align-items:center; justify-content:space-between;">
+          <div>
+            <h1 class="page-title">Fan Config</h1>
+            <p class="page-subtitle">Assign a temperature sensor and curve to each fan</p>
+          </div>
+          <button class="btn btn-primary" onclick="openAddModal()">+ Add Fan</button>
+        </div>
+      </div>
+
+      <div class="card" style="padding:0">
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th>Fan</th>
+              <th>Label</th>
+              <th>Sensor</th>
+              <th>Curve</th>
+              <th>Override</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody id="fanconfig-tbody">
+            <tr><td colspan="6" style="color:var(--text-muted);padding:20px">Loading…</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- Add/Edit modal -->
+  <div class="modal-overlay" id="fan-modal">
+    <div class="modal">
+      <div class="modal-title" id="modal-title">Add Fan</div>
+      <input type="hidden" id="edit-index" value="-1" />
+
+      <div class="form-group">
+        <label class="form-label">Fan channel</label>
+        <select class="form-select" id="modal-fan-id"></select>
+      </div>
+      <div class="form-group">
+        <label class="form-label">Label (optional)</label>
+        <input class="form-input" id="modal-fan-label" placeholder="e.g. Upper rear left" />
+      </div>
+      <div class="form-group">
+        <label class="form-label">Temperature sensor</label>
+        <select class="form-select" id="modal-sensor-id"></select>
+      </div>
+      <div class="form-group">
+        <label class="form-label">Curve</label>
+        <select class="form-select" id="modal-curve-name"></select>
+      </div>
+
+      <!-- Manual override -->
+      <div class="toggle-row">
+        <div>
+          <div class="toggle-label">Manual override</div>
+          <div class="toggle-sub">Bypass curve and hold a fixed speed</div>
+        </div>
+        <label class="toggle">
+          <input type="checkbox" id="modal-override-enabled" onchange="toggleOverrideInput()" />
+          <span class="toggle-slider"></span>
+        </label>
+      </div>
+      <div class="override-input-row" id="override-input-row">
+        <input class="form-input" type="number" id="modal-override-percent"
+          min="0" max="100" value="50" />
+        <span class="unit">% fixed speed</span>
+      </div>
+
+      <div class="modal-actions">
+        <button class="btn btn-ghost" onclick="closeModal()">Cancel</button>
+        <button class="btn btn-primary" onclick="saveEntry()">Save</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast"></div>
+  <script src="/app.js"></script>
+  <script>
+    let config = null;
+    let devices = null;
+
+    async function loadAll() {
+      try {
+        [config, devices] = await Promise.all([
+          api('GET', '/config'),
+          api('GET', '/devices'),
+        ]);
+        render();
+      } catch (e) {
+        showToast('Failed to load: ' + e.message, 'error');
+      }
+    }
+
+    function sensorDisplayName(sensorId) {
+      // Check aliases first
+      if (config.sensor_aliases && config.sensor_aliases[sensorId]) {
+        return config.sensor_aliases[sensorId];
+      }
+      // Check virtual sensors
+      const vs = (config.virtual_sensors || []).find(v => v.id === sensorId);
+      if (vs) return vs.name + ' [virtual]';
+      // Fallback to last segment
+      return sensorId.split('/').pop();
+    }
+
+    function render() {
+      const tbody = document.getElementById('fanconfig-tbody');
+      if (!config.fan_configs.length) {
+        tbody.innerHTML = `<tr><td colspan="6" style="color:var(--text-muted);padding:24px;text-align:center">
+          No fans configured. Click <strong>+ Add Fan</strong> to start.
+        </td></tr>`;
+        return;
+      }
+      tbody.innerHTML = config.fan_configs.map((fc, i) => {
+        const isOverride = fc.override_percent != null;
+        return `
+          <tr>
+            <td><span class="mono" style="font-size:12px">${fc.fan_id}</span></td>
+            <td>${fc.fan_label || '—'}</td>
+            <td><span class="mono" style="font-size:11px;color:var(--text-dim)">${sensorDisplayName(fc.sensor_id)}</span></td>
+            <td>${isOverride
+              ? '<span class="badge badge-dim" style="text-decoration:line-through">' + fc.curve_name + '</span>'
+              : '<span class="badge badge-green">' + fc.curve_name + '</span>'
+            }</td>
+            <td>${isOverride
+              ? `<span class="badge badge-warn">${fc.override_percent}% manual</span>`
+              : '<span style="color:var(--text-muted);font-size:12px">—</span>'
+            }</td>
+            <td style="text-align:right">
+              <button class="btn btn-ghost" style="padding:5px 10px;font-size:12px;margin-right:6px"
+                onclick="openEditModal(${i})">Edit</button>
+              <button class="btn btn-danger-ghost" style="padding:5px 10px;font-size:12px"
+                onclick="deleteEntry(${i})">Delete</button>
+            </td>
+          </tr>
+        `;
+      }).join('');
+    }
+
+    function toggleOverrideInput() {
+      const enabled = document.getElementById('modal-override-enabled').checked;
+      document.getElementById('override-input-row').classList.toggle('visible', enabled);
+      // Sensor and curve selects are still shown — they're kept in config for when override is disabled
+    }
+
+    function populateModalSelects(existing = null) {
+      const fanSel = document.getElementById('modal-fan-id');
+      const sensorSel = document.getElementById('modal-sensor-id');
+      const curveSel = document.getElementById('modal-curve-name');
+
+      fanSel.innerHTML = (devices.fans || []).map(f =>
+        `<option value="${f.id}" ${existing?.fan_id === f.id ? 'selected' : ''}>${f.label}</option>`
+      ).join('');
+
+      // Real sensors
+      let sensorOptions = (devices.sensors || []).map(s => {
+          const display = s.alias ? s.alias + ' (' + s.id + ')' : s.label;
+          return `<option value="${s.id}" ${existing?.sensor_id === s.id ? 'selected' : ''}>${display}</option>`;
+        });
+
+      // Virtual sensors
+      const vsOptions = (devices.virtual_sensors || []).map(vs => {
+          const display = vs.label + ' [virtual]';
+          return `<option value="${vs.id}" ${existing?.sensor_id === vs.id ? 'selected' : ''}>${display}</option>`;
+        });
+
+      if (vsOptions.length) {
+        sensorOptions.push('<option disabled>── Virtual Sensors ──</option>');
+        sensorOptions = sensorOptions.concat(vsOptions);
+      }
+
+      sensorSel.innerHTML = sensorOptions.join('');
+
+      curveSel.innerHTML = (config.curves || []).map(c =>
+        `<option value="${c.name}" ${existing?.curve_name === c.name ? 'selected' : ''}>${c.name}</option>`
+      ).join('');
+
+      if (!config.curves.length) {
+        curveSel.innerHTML = '<option value="">— No curves defined —</option>';
+      }
+
+      // Override fields
+      const overrideEnabled = existing?.override_percent != null;
+      document.getElementById('modal-override-enabled').checked = overrideEnabled;
+      document.getElementById('modal-override-percent').value = existing?.override_percent ?? 50;
+      document.getElementById('override-input-row').classList.toggle('visible', overrideEnabled);
+    }
+
+    function openAddModal() {
+      document.getElementById('modal-title').textContent = 'Add Fan';
+      document.getElementById('edit-index').value = '-1';
+      document.getElementById('modal-fan-label').value = '';
+      populateModalSelects();
+      document.getElementById('fan-modal').classList.add('open');
+    }
+
+    function openEditModal(i) {
+      const fc = config.fan_configs[i];
+      document.getElementById('modal-title').textContent = 'Edit Fan';
+      document.getElementById('edit-index').value = i;
+      document.getElementById('modal-fan-label').value = fc.fan_label || '';
+      populateModalSelects(fc);
+      document.getElementById('fan-modal').classList.add('open');
+    }
+
+    function closeModal() {
+      document.getElementById('fan-modal').classList.remove('open');
+    }
+
+    async function saveEntry() {
+      const idx = parseInt(document.getElementById('edit-index').value);
+      const fan_id = document.getElementById('modal-fan-id').value;
+      const fan_label = document.getElementById('modal-fan-label').value.trim()
+        || document.getElementById('modal-fan-id').selectedOptions[0]?.text.split(' (')[0] || fan_id;
+      const sensor_id = document.getElementById('modal-sensor-id').value;
+      const curve_name = document.getElementById('modal-curve-name').value;
+      const overrideEnabled = document.getElementById('modal-override-enabled').checked;
+      const override_percent = overrideEnabled
+        ? parseInt(document.getElementById('modal-override-percent').value)
+        : null;
+
+      if (!fan_id || !sensor_id || !curve_name) {
+        showToast('Fan, sensor and curve are required', 'error'); return;
+      }
+      if (overrideEnabled && (isNaN(override_percent) || override_percent < 0 || override_percent > 100)) {
+        showToast('Override percent must be between 0 and 100', 'error'); return;
+      }
+
+      const backend = (devices.fans || []).find(f => f.id === fan_id)?.backend || 'liquidctl';
+      const entry = { fan_id, fan_label, sensor_id, curve_name, override_percent, backend };
+
+      if (idx === -1) {
+        config.fan_configs.push(entry);
+      } else {
+        config.fan_configs[idx] = entry;
+      }
+
+      try {
+        await api('POST', '/config', config);
+        showToast('Saved', 'ok');
+        closeModal();
+        render();
+      } catch (e) {
+        showToast('Save failed: ' + e.message, 'error');
+        config = await api('GET', '/config');
+        render();
+      }
+    }
+
+    async function deleteEntry(i) {
+      if (!confirm(`Remove fan "${config.fan_configs[i].fan_id}" from config?`)) return;
+      config.fan_configs.splice(i, 1);
+      try {
+        await api('POST', '/config', config);
+        showToast('Removed', 'ok');
+        render();
+      } catch (e) {
+        showToast('Failed: ' + e.message, 'error');
+        config = await api('GET', '/config');
+        render();
+      }
+    }
+
+    loadAll();
+  </script>
+</body>
+</html>
