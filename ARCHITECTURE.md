@@ -1,7 +1,7 @@
 # Fan Control Service — Architecture Document
 
-**Status:** v1.0.1 — implemented and running
-**Last Updated:** May 10, 2026
+**Status:** v1.0.2 — implemented and running
+**Last Updated:** September 14, 2026
 
 ---
 
@@ -135,13 +135,13 @@ The controller loop runs as an asyncio background task inside the Uvicorn proces
       "fan_id": "hwmon-pwm-nct6687.2592/pwm1",
       "fan_label": "CPU Fan",
       "curve_name": "silent",
-      "sensor_id": "k10temp-hwmon3/Tctl",
+      "sensor_id": "coretemp-coretemp.0/Package id 0",
       "override_percent": null,
       "backend": "hwmon-pwm"
     }
   ],
   "sensor_aliases": {
-    "nvme-hwmon1/Sensor 1": "NVMe Boot Drive",
+    "nct6798-nct6775.656/SYSTIN": "System Temp",
     "drivetemp-wwid-naa.5000000000000001/WDC WD120XXXX": "NAS Drive 1"
   },
   "virtual_sensors": [
@@ -166,7 +166,7 @@ The controller loop runs as an asyncio background task inside the Uvicorn proces
       "id": "grp-cpu-b7x2p",
       "name": "CPU",
       "type": "sensor",
-      "item_ids": ["coretemp-hwmon0/Core 0", "coretemp-hwmon0/Core 1"]
+      "item_ids": ["coretemp-coretemp.0/Core 0", "coretemp-coretemp.0/Core 1"]
     }
   ],
   "card_colors": {
@@ -245,6 +245,7 @@ On startup (and via `GET /api/devices`), the service detects:
 - Read `name` file to identify driver
 - Read available `tempN_input` files
 - Read `tempN_label` if present (e.g. "Package id 0", "Core 0")
+- Build a stable sensor ID from the platform device component when the device has one: `<driver>-<device>.<address>/<label>` (e.g. `nct6798-nct6775.656/SYSTIN`, `coretemp-coretemp.0/Package id 0`). Devices without one (PCI-only devices such as `nvme` or `k10temp`, where `stable_device_id()` finds no match) fall back to the hwmon directory name: `<driver>-hwmonN/<label>`
 - For `drivetemp` sensors: correlate the hwmon path back to the block device via `/sys/class/block`, read the model from `device/model` and the WWID from `device/wwid`, and produce:
   - A stable sensor ID using the WWID and model only: `drivetemp-wwid-<WWID>/<model>`
   - Example: `drivetemp-wwid-naa.5000000000000001/WDC WD120XXXX`
@@ -252,9 +253,9 @@ On startup (and via `GET /api/devices`), the service detects:
   - Falls back to hwmon directory name if WWID is unavailable
 - Return structured list: `{ id, driver, label, current_temp, alias? }`
 
-**Why WWID for drivetemp IDs?** hwmon directory numbers (`hwmon5`, `hwmon6`...) are assigned by the kernel at boot based on driver load order and can shift if drives are added, removed, or reordered. The WWID (`/sys/class/block/<dev>/device/wwid`) is a globally unique hardware identifier that is stable across reboots and drive reordering — making it safe to use as the persistent sensor ID in `config.json`. The block device letter (`/dev/sdX`) is also unstable across reboots and is therefore excluded from the sensor ID. Non-drivetemp sensors (coretemp, nvme, quadro, etc.) use hwmon-based IDs since their kernel assignment order is deterministic for PCI/onboard devices.
+**Why stable IDs for temperature sensors?** hwmon directory numbers (`hwmon5`, `hwmon6`...) are assigned by the kernel at boot based on driver load order and can shift when drivers, drives, or devices are added, removed, or reordered — the same reboot-triggered renumbering already solved for hwmon-pwm fan IDs. A Super I/O chip can move from `hwmon10` to `hwmon12` between boots even though the device itself never moved. Using the platform device component (`nct6775.656`, `coretemp.0`) keeps the sensor ID pointed at the same physical device. The WWID (`/sys/class/block/<dev>/device/wwid`) is the equivalent stable identifier for `drivetemp` sensors, and the block device letter (`/dev/sdX`) is excluded from the ID for the same reason.
 
-**Config migration:** On startup, `load_config()` runs `migrate_drivetemp_ids()` which detects old-style drivetemp IDs containing a block device letter (e.g. `drivetemp-wwid-<WWID>/sda — <model>`) and rewrites them to the new format (`drivetemp-wwid-<WWID>/<model>`) across all config sections: `sensor_aliases`, `virtual_sensors`, `fan_configs`, `dashboard_groups`, and `card_colors`. If any IDs were migrated, the config is saved back to disk automatically. Each migrated ID is logged individually at INFO level.
+**Config migration:** On startup, `load_config()` runs `migrate_sensor_ids()`, which rewrites both old drivetemp IDs containing a block device letter (e.g. `drivetemp-wwid-<WWID>/sda — <model>` → `drivetemp-wwid-<WWID>/<model>`) and IDs that embed a volatile hwmon directory number (e.g. `nct6798-hwmon10/SYSTIN` → `nct6798-nct6775.656/SYSTIN`). The hwmon rewrite matches the stored `(driver, label)` pair against the current hwmon scan, so a config whose stored `hwmonN` was already renumbered by a reboot is repaired rather than rejected. A legacy ID is rewritten only when exactly one detected sensor matches, because labels are not unique (several NVMe drives all report `Composite`); unmatched or ambiguous IDs are left untouched. Rewrites apply across all config sections: `sensor_aliases`, `virtual_sensors`, `fan_configs`, `dashboard_groups`, and `card_colors`. If any IDs were migrated, the config is saved back to disk automatically, and each migrated ID is logged individually at INFO level. The migration scan passes `include_smartctl=False` so startup does not shell out to smartctl per drive.
 
 **Fans (liquidctl backend)** — query liquidctl:
 - Run `liquidctl list --json` to find connected devices
@@ -317,7 +318,7 @@ No hardcoded sensor or fan names anywhere in the codebase.
       "name": "CPU",
       "items": [
         {
-          "sensor_id": "coretemp-hwmon0/Core 0",
+          "sensor_id": "coretemp-coretemp.0/Core 0",
           "alias": "CPU Core 0",
           "temp": 42.0,
           "virtual": false,
@@ -482,7 +483,7 @@ brisa/
 │   └── app/
 │       ├── main.py              ← FastAPI app, lifespan, global config/loop state
 │       ├── models.py            ← Pydantic models (AppConfig, FanConfig with backend field, Curve, VirtualSensor, DashboardGroup, etc.)
-│       ├── config.py            ← load/save/validate config.json, drivetemp ID migration (incl. virtual sensor + group + color validation)
+│       ├── config.py            ← load/save/validate config.json, sensor ID migration (incl. virtual sensor + group + color validation)
 │       ├── controller.py        ← loop logic, backend routing, interpolation, virtual sensor resolution, _last_applied cache
 │       ├── sensors.py           ← /sys/class/hwmon temperature reader + drivetemp enrichment (renamed from hwmon.py)
 │       ├── hwmon_pwm.py         ← sysfs PWM fan detection, control, takeover/release lifecycle
@@ -630,6 +631,6 @@ Some hwmon devices expose `fanN_input` (RPM reading) without a corresponding wri
 - [ ] Hysteresis support in curves (fans only spin down below X, only spin up above Y)
 - [ ] Multi-device support (multiple liquidctl controllers simultaneously)
 - [ ] Auth on the web UI (basic auth option)
-- [ ] NVMe and other PCI sensor hwmon numbers are stable in practice but not guaranteed — WWID-style stable IDs for those sensors would be a future improvement
+- [ ] PCI-only sensors (no platform device component, e.g. `nvme`, `k10temp`) still fall back to hwmon directory numbers in their IDs; those are stable in practice but not guaranteed — serial/WWID-style stable IDs for them would be a future improvement
 - [ ] GPU fan control via amdgpu hwmon (detected but currently skipped — needs testing and safety review)
 - [ ] Expand hwmon-pwm deduplication blocklist as more liquidctl-backed devices are reported

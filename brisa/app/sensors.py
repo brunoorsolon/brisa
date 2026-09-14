@@ -11,6 +11,11 @@ _smartctl_available: bool | None = None
 HWMON_PATH = "/sys/class/hwmon"
 BLOCK_PATH = "/sys/class/block"
 
+# Platform/onboard device names of the form "<name>.<address>", e.g.
+# "nct6775.656" or "coretemp.0". The address comes from the device's
+# physical location, so the name stays stable across reboots.
+_STABLE_DEVICE_RE = re.compile(r'^[a-zA-Z][a-zA-Z0-9_]*\.\d+$')
+
 
 def _read_file(path: str) -> str | None:
     """Read a sysfs file and return stripped content, or None on failure."""
@@ -19,6 +24,23 @@ def _read_file(path: str) -> str | None:
             return f.read().strip()
     except OSError:
         return None
+
+
+def stable_device_id(hwmon_path: str) -> str | None:
+    """
+    Extract a stable device identifier from the hwmon real path.
+
+    Example:
+        /sys/devices/platform/nct6775.656/hwmon/hwmon10
+        -> "nct6775.656"
+
+    Looks for a platform device component (driver.address) in the path.
+    Returns None if no stable component can be identified.
+    """
+    for part in os.path.realpath(hwmon_path).split("/"):
+        if _STABLE_DEVICE_RE.match(part):
+            return part
+    return None
 
 
 def _safe_wwid(wwid: str) -> str:
@@ -184,23 +206,30 @@ def _detect_smartctl_sensors() -> list[dict]:
     return sensors
 
 
-def detect_sensors() -> list[dict]:
+def detect_sensors(include_smartctl: bool = True) -> list[dict]:
     """
     Scan /sys/class/hwmon and return all available temperature sensors.
 
     Returns a list of dicts:
         {
-            "id": "coretemp-hwmon4/Package id 0",
+            "id": "coretemp-coretemp.0/Package id 0",
             "driver": "coretemp",
             "label": "Package id 0",
             "current_temp": 38.0
         }
+
+    Sensor IDs never embed the hwmon directory number (hwmonN): the kernel
+    assigns those at boot and can renumber them across reboots. Devices with a
+    platform device component use it instead (e.g. "nct6798-nct6775.656/SYSTIN");
+    devices without one fall back to the hwmon directory name.
 
     For drivetemp sensors the id uses WWID + model only (no block device letter):
         "drivetemp-wwid-naa.50014ee2c1c21634/WDC WD120EFGX-68"
     The label still includes the block device letter for display:
         "sda — WDC WD120EFGX-68"
     Falls back to hwmon directory name if WWID is unavailable.
+
+    Set include_smartctl=False to skip the (slower) smartctl fallback scan.
     """
     sensors = []
     drivetemp_map = _build_drivetemp_map()
@@ -220,6 +249,7 @@ def detect_sensors() -> list[dict]:
             device_path = hwmon_full
 
         driver = _read_file(os.path.join(device_path, "name")) or hwmon_dir
+        stable_id = stable_device_id(device_path)
 
         try:
             entries = os.listdir(device_path)
@@ -251,7 +281,10 @@ def detect_sensors() -> list[dict]:
             else:
                 label_raw = _read_file(os.path.join(device_path, f"temp{n}_label"))
                 label = label_raw if label_raw else f"temp{n}"
-                sensor_id = f"{driver}-{hwmon_dir}/{label}"
+                # Prefer the stable device component over the volatile hwmonN
+                # directory, which the kernel can renumber across reboots.
+                id_scope = stable_id or hwmon_dir
+                sensor_id = f"{driver}-{id_scope}/{label}"
 
             sensors.append({
                 "id": sensor_id,
@@ -261,10 +294,11 @@ def detect_sensors() -> list[dict]:
             })
 
     # Fallback: detect SAS/SCSI drives via smartctl (no hwmon coverage)
-    smartctl_sensors = _detect_smartctl_sensors()
-    if smartctl_sensors:
-        logger.info("Detected %d additional sensor(s) via smartctl", len(smartctl_sensors))
-        sensors.extend(smartctl_sensors)
+    if include_smartctl:
+        smartctl_sensors = _detect_smartctl_sensors()
+        if smartctl_sensors:
+            logger.info("Detected %d additional sensor(s) via smartctl", len(smartctl_sensors))
+            sensors.extend(smartctl_sensors)
 
     logger.info("Detected %d temperature sensor(s)", len(sensors))
     return sensors

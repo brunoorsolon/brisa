@@ -2,6 +2,8 @@ import logging
 import os
 import re
 
+from app.sensors import stable_device_id
+
 logger = logging.getLogger(__name__)
 
 HWMON_PATH = "/sys/class/hwmon"
@@ -33,26 +35,6 @@ def _write_file(path: str, value: str) -> bool:
     except OSError as e:
         logger.error("Failed to write '%s' to %s: %s", value, path, e)
         return False
-
-
-def _stable_device_id(hwmon_path: str) -> str | None:
-    """
-    Extract a stable device identifier from the hwmon real path.
-
-    Example:
-        /sys/devices/platform/nct6687.2592/hwmon/hwmon7
-        -> "nct6687.2592"
-
-    Looks for a platform device component (driver.address) in the path.
-    Returns None if no stable component can be identified.
-    """
-    real = os.path.realpath(hwmon_path)
-    # Walk the path components looking for platform device pattern
-    # e.g. "nct6687.2592", "it8688.2592", "w83627ehf.656"
-    for part in real.split("/"):
-        if re.match(r'^[a-zA-Z][a-zA-Z0-9_]*\.\d+$', part):
-            return part
-    return None
 
 
 def detect_pwm_fans() -> list[dict]:
@@ -94,7 +76,7 @@ def detect_pwm_fans() -> list[dict]:
             continue
 
         # Find a stable device ID for this hwmon entry
-        stable_id = _stable_device_id(hwmon_full)
+        stable_id = stable_device_id(hwmon_full)
         if not stable_id:
             logger.debug("Skipping %s (%s): no stable device ID found", hwmon_dir, driver)
             continue
@@ -183,7 +165,7 @@ def _resolve_paths(fan_id: str) -> dict | None:
 
     for hwmon_dir in hwmon_dirs:
         hwmon_full = os.path.join(HWMON_PATH, hwmon_dir)
-        stable_id = _stable_device_id(hwmon_full)
+        stable_id = stable_device_id(hwmon_full)
         if stable_id == target_device_id:
             pwm_path = os.path.join(hwmon_full, pwm_name)
             if os.path.exists(pwm_path):
