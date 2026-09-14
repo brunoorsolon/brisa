@@ -67,7 +67,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Brisa",
     description="Docker-based fan control service",
-    version="1.0.1",
+    version="1.0.2",
     lifespan=lifespan,
 )
 

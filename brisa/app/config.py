@@ -18,8 +18,16 @@ _OLD_DRIVETEMP_RE = re.compile(
     r'^(drivetemp-wwid-[^/]+)/sd[a-z]+ \u2014 (.+)$'
 )
 
+# Regex to match legacy hwmon-directory-based sensor IDs:
+#   <driver>-hwmon<N>/<label>   e.g. "nct6798-hwmon10/SYSTIN"
+# Captures the driver and label so the ID can be re-resolved against the
+# currently detected devices even after the kernel renumbered hwmonN.
+_LEGACY_HWMON_RE = re.compile(
+    r'^(?P<driver>.+?)-hwmon\d+/(?P<label>.+)$'
+)
 
-def _migrate_sensor_id(old_id: str) -> str:
+
+def _migrate_drivetemp_id(old_id: str) -> str:
     """
     If old_id matches the old drivetemp format with /sdX, return the new
     format with model only.  Otherwise return the original ID unchanged.
@@ -30,66 +38,81 @@ def _migrate_sensor_id(old_id: str) -> str:
     return old_id
 
 
-def migrate_drivetemp_ids(config: AppConfig) -> tuple[AppConfig, int]:
+def _migrate_hwmon_id(
+    old_id: str,
+    known_ids: set[str],
+    by_driver_label: dict[tuple[str, str], set[str]],
+) -> str:
     """
-    Rewrite any old-style drivetemp sensor IDs (containing /sdX) to the
-    new stable format (WWID + model only).
+    Rewrite a legacy hwmon-directory-based sensor ID to the current stable ID.
 
-    Returns (possibly-modified config, number of IDs migrated).
+    Only rewrites when the (driver, label) pair maps to exactly one detected
+    sensor — labels are not guaranteed unique (several NVMe drives all report
+    "Composite"), and guessing could point a fan at the wrong sensor.
+    """
+    if old_id in known_ids:
+        return old_id
+
+    m = _LEGACY_HWMON_RE.match(old_id)
+    if not m:
+        return old_id
+
+    candidates = by_driver_label.get((m.group("driver"), m.group("label")))
+    if not candidates or len(candidates) != 1:
+        return old_id
+    return next(iter(candidates))
+
+
+def _rewrite_sensor_ids(config: AppConfig, rewrite) -> int:
+    """
+    Apply rewrite() to every sensor ID stored in the config.
+    Returns the number of IDs that changed.
     """
     count = 0
 
-    # sensor_aliases: keys are sensor IDs
-    new_aliases: dict[str, str] = {}
-    for sid, alias in config.sensor_aliases.items():
-        new_sid = _migrate_sensor_id(sid)
-        if new_sid != sid:
+    def fix(sensor_id: str) -> str:
+        nonlocal count
+        new_id = rewrite(sensor_id)
+        if new_id != sensor_id:
             count += 1
-            logger.info("Migrated alias key: %s -> %s", sid, new_sid)
-        new_aliases[new_sid] = alias
-    config.sensor_aliases = new_aliases
+            logger.info("Migrated sensor ID: %s -> %s", sensor_id, new_id)
+        return new_id
 
-    # virtual_sensors: source_sensor_ids
+    config.sensor_aliases = {fix(sid): alias for sid, alias in config.sensor_aliases.items()}
     for vs in config.virtual_sensors:
-        new_sources = []
-        for sid in vs.source_sensor_ids:
-            new_sid = _migrate_sensor_id(sid)
-            if new_sid != sid:
-                count += 1
-                logger.info("Migrated virtual sensor '%s' source: %s -> %s", vs.id, sid, new_sid)
-            new_sources.append(new_sid)
-        vs.source_sensor_ids = new_sources
-
-    # fan_configs: sensor_id
+        vs.source_sensor_ids = [fix(sid) for sid in vs.source_sensor_ids]
     for fc in config.fan_configs:
-        new_sid = _migrate_sensor_id(fc.sensor_id)
-        if new_sid != fc.sensor_id:
-            count += 1
-            logger.info("Migrated fan config '%s' sensor: %s -> %s", fc.fan_id, fc.sensor_id, new_sid)
-            fc.sensor_id = new_sid
-
-    # dashboard_groups: item_ids
+        fc.sensor_id = fix(fc.sensor_id)
     for grp in config.dashboard_groups:
-        new_items = []
-        for sid in grp.item_ids:
-            new_sid = _migrate_sensor_id(sid)
-            if new_sid != sid:
-                count += 1
-                logger.info("Migrated group '%s' item: %s -> %s", grp.name, sid, new_sid)
-            new_items.append(new_sid)
-        grp.item_ids = new_items
+        grp.item_ids = [fix(sid) for sid in grp.item_ids]
+    config.card_colors = {fix(sid): color for sid, color in config.card_colors.items()}
 
-    # card_colors: keys are sensor/fan IDs
-    new_colors: dict[str, str] = {}
-    for sid, color in config.card_colors.items():
-        new_sid = _migrate_sensor_id(sid)
-        if new_sid != sid:
-            count += 1
-            logger.info("Migrated card color key: %s -> %s", sid, new_sid)
-        new_colors[new_sid] = color
-    config.card_colors = new_colors
+    return count
 
-    return config, count
+
+def migrate_sensor_ids(config: AppConfig) -> tuple[AppConfig, int]:
+    """
+    Rewrite old drivetemp IDs (with a block device letter) to the WWID + model
+    form, and sensor IDs that embed a volatile hwmon directory number
+    (e.g. "nct6798-hwmon10/SYSTIN") to the current stable form
+    (e.g. "nct6798-nct6775.656/SYSTIN").
+
+    The current hwmon scan supplies the stable IDs, so this also repairs
+    configs whose stored hwmonN was renumbered by a reboot. Sensors that are
+    not currently detected are left untouched rather than guessed at.
+    """
+    from app.sensors import detect_sensors
+
+    sensors = detect_sensors(include_smartctl=False)
+    known_ids = {s["id"] for s in sensors}
+    by_driver_label: dict[tuple[str, str], set[str]] = {}
+    for s in sensors:
+        by_driver_label.setdefault((s["driver"], s["label"]), set()).add(s["id"])
+
+    def rewrite(sensor_id: str) -> str:
+        return _migrate_hwmon_id(_migrate_drivetemp_id(sensor_id), known_ids, by_driver_label)
+
+    return config, _rewrite_sensor_ids(config, rewrite)
 
 
 def load_config() -> AppConfig:
@@ -124,12 +147,12 @@ def load_config() -> AppConfig:
     if backend_fixed:
         save_config(config)
 
-    # Migrate old drivetemp IDs if needed
-    config, migrated = migrate_drivetemp_ids(config)
+    # Migrate old drivetemp IDs and legacy hwmon-directory-based sensor IDs
+    config, migrated = migrate_sensor_ids(config)
     if migrated > 0:
-        logger.warning("Migrated %d old-style drivetemp sensor ID(s) in config", migrated)
+        logger.warning("Migrated %d sensor ID(s) in config", migrated)
         save_config(config)
-        logger.info("Config saved after drivetemp ID migration")
+        logger.info("Config saved after sensor ID migration")
 
     return config
 
